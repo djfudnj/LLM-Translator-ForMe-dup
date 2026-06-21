@@ -1,0 +1,3666 @@
+import {
+    eventSource,
+    event_types,
+    getRequestHeaders,
+    reloadCurrentChat,
+    saveSettingsDebounced,
+    substituteParams,
+    updateMessageBlock,
+    callPopup,
+    generateRaw
+} from '../../../../script.js';
+
+import { extension_settings, getContext, saveMetadataDebounced } from '../../../extensions.js';
+import { SECRET_KEYS, secret_state } from '../../../secrets.js';
+import { POPUP_TYPE, callGenericPopup } from '../../../popup.js';
+import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
+import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
+import { ARGUMENT_TYPE, SlashCommandArgument, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import { oai_settings } from '../../../openai.js';
+
+const DB_NAME = 'LLMtranslatorDB';
+const STORE_NAME = 'translations';
+const METADATA_BACKUP_KEY = 'llmTranslationCacheBackup'; // 메타데이터 백업 키
+const RULE_PROMPT_KEY = 'llmRulePrompt'; // 규칙 프롬프트 메타데이터 키
+const extensionName = "LLM-Translator-ForMe";
+const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
+const DEBUG_MODE = false; // 디버그 로그 활성화 플래그
+
+let extensionSettings = extension_settings[extensionName];
+if (!extensionSettings) {
+    extensionSettings = {};
+    extension_settings[extensionName] = extensionSettings;
+}
+
+// provider별 oai_settings 모델 필드 이름
+const PROVIDER_MODEL_FIELD = {
+    vertexai:   'vertexai_model',
+    makersuite: 'google_model',
+    openai:     'openai_model',
+    claude:     'claude_model',
+    openrouter: 'openrouter_model',
+    cohere:     'cohere_model',   // 없으면 무시됨
+};
+
+// provider별 chat_completion_source 값
+const PROVIDER_SOURCE = {
+    vertexai:   'vertexai',
+    makersuite: 'makersuite',
+    openai:     'openai',
+    claude:     'claude',
+    openrouter: 'openrouter',
+    cohere:     'cohere',
+};
+
+// 번역 진행 상태 추적 (단순화)
+const translationInProgress = {};
+
+// 디버그용 함수: 현재 번역 진행 상태 출력
+function logTranslationStatus() {
+    const activeTranslations = Object.entries(translationInProgress).filter(([id, status]) => status);
+    console.log(`[DEBUG] Active translations:`, activeTranslations.length > 0 ? activeTranslations : 'None');
+}
+
+// 전역 디버그 함수 (콘솔에서 수동 호출 가능)
+window.debugLLMTranslator = function() {
+    console.log('=== LLM Translator Debug Info ===');
+    console.log('Auto translate enabled:', extensionSettings.auto_translate_new_messages);
+    console.log('Translation progress:', translationInProgress);
+    console.log('Chat translation in progress:', isChatTranslationInProgress);
+    logTranslationStatus();
+    console.log('===================================');
+};
+
+// 전체 채팅 번역 상태 (기존 복잡한 플래그들 제거)
+let isChatTranslationInProgress = false;
+
+// 기본 세팅 (InputFeedback 방식)
+const defaultSettings = {
+    translation_display_mode: 'disabled',
+    provider: 'main',           // 'main' | 'openai' | 'claude' | 'makersuite' | 'vertexai' | 'openrouter' | 'cohere'
+    model: '',                  // provider가 'main'이면 무시됨
+    maxTokens: 1000,
+    throttle_delay: '0',
+    show_input_translate_button: false,
+    auto_translate_new_messages: false,      
+    force_sequential_matching: false,        
+    hide_legacy_translate_button: false,     
+    hide_toggle_button: false,               
+    hide_new_translate_button: true,         
+    hide_paragraph_button: true,             
+    hide_edit_button: false,                 
+    hide_delete_button: true,                
+    use_reverse_proxy: false,
+    reverse_proxy_url: '',
+    reverse_proxy_password: '',
+    llm_prompt_chat: 'Please translate the following text to korean:',
+    llm_prompt_retranslate_correction: `# 역할
+당신은 '최소 수정 원칙(Principle of Minimal Intervention)'을 따르는 번역 교정 전문가입니다. 당신의 임무는 원문의 스타일과 표현을 보존하면서, 명백한 오류만 외과수술처럼 정밀하게 수정하는 것입니다.
+
+# 핵심 지침
+* **절대 재창작 금지:** 텍스트에 있는 온전한 문장들을 더 나은 표현으로 재구성하려 하지 마세요.
+* **오류만 수정:** 아래 '수정 규칙'에 위배되는 부분만 찾아 수정하고, 그 외의 모든 부분은 그대로 유지해야 합니다.
+
+# 수정 규칙
+1.  **뜬금없는 외국어:** 번역문에 한국어와 필수 외래어를 제외한 뜬금없는 외국어 단어(러시아어, 키릴 문자 등)가 있다면 자연스러운 한국어로 다시 번역합니다.
+3.  **추가 규칙:** 추가 규칙 프롬프트가 존재한다면 번역문은 이를 따라야합니다.
+
+# 출력 형식
+* 다른 설명이나 인사 없이, 오직 최종적으로 완성된 번역문 전체만 제공해야 합니다.`,
+    llm_prompt_retranslate_guidance: `# 역할
+당신은 한국어 번역 교정 전문가입니다. 당신의 임무는 불안정한 초안 번역을 아래의 지침에 따라 정밀하게 교정하는 것입니다.
+
+# 핵심 지침
+* **재창작 금지:** 텍스트에 있는 모든 문장들을 더 나은 표현으로 재구성하려 하지 마세요.
+* **지침 따르기:** 아래의 '추가 지침'에 해당되는 문장들만 수정하고, 그 외의 모든 부분은 그대로 유지해야 합니다.
+
+# 출력 형식
+* 다른 설명이나 인사 없이, 오직 최종적으로 완성된 번역문 전체만 제공해야 합니다.`,
+    llm_prompt_retranslate_paragraph: `# 역할
+당신은 텍스트 구조 교정가입니다. 현재 초안 번역문에는 줄 바꿈, 문단 개수가 원문과 일치하지않는 문제가 있습니다. 원문의 형식과 정확히 일치하도록 번역문을 교정해주세요.
+
+# 주의사항
+* **불필요한 번역 교정 금지:** 텍스트에 있는 문장들을 더 나은 표현으로 재구성하려 하지 마세요. 당신은 번역 교정가가 아닌 구조 교정가입니다.
+* **지침 따르기:** 아래의 문제가 발생한 사례만 파악하여 구조를 교정해주세요.
+
+# 지침:
+1. 줄바꿈 규칙
+   - 원문의 모든 줄바꿈을 번역문에 동일하게 유지
+   - 한 줄 띄움과 두 줄 띄움을 구분하여 정확히 반영
+   - 임의로 줄바꿈을 추가하거나 제거하지 않음
+
+2. 구조적 일치
+   - 원문과 번역문의 문단 수 일치
+   - 각 문단의 위치와 순서 유지
+
+3. 내용 점검
+   - 원문에 없는 추가 문단 제거
+   - 원문에서 누락된 문단이 있다면 추가
+
+# 출력 형식
+* 다른 설명이나 인사 없이, 오직 최종적으로 완성된 번역문 전체만 제공해야 합니다.`,
+    llm_prompt_input: 'Please translate the following text to english:',
+    llm_prefill_toggle: false,
+    llm_prefill_content: 'Understood. Executing the translation as instructed. Here is the translation:',
+    selected_translation_prompt_id: null,  
+    selected_translation_prompt: null,     
+    temperature: 0.7,
+};
+
+// ──────────────────────────────────────────────
+// 마이그레이션 및 UI 바인딩 함수
+// ──────────────────────────────────────────────
+function migrateOldProviderSettings() {
+    // 기존 llm_provider → 새 provider로 마이그레이션
+    if (extensionSettings.llm_provider && !extensionSettings.provider) {
+        const legacyMap = {
+            openai:  'openai',
+            claude:  'claude',
+            google:  'makersuite',
+            cohere:  'cohere',
+        };
+        extensionSettings.provider = legacyMap[extensionSettings.llm_provider] || 'main';
+
+        // 기존 모델 이력에서 모델명 복원
+        const legacyModel = extensionSettings.provider_model_history?.[extensionSettings.llm_provider];
+        if (legacyModel) extensionSettings.model = legacyModel;
+
+        // 구 설정 키 정리
+        delete extensionSettings.llm_provider;
+        delete extensionSettings.llm_model;
+        delete extensionSettings.parameters;
+        delete extensionSettings.provider_model_history;
+
+        saveSettingsDebounced();
+    }
+}
+
+function loadProviderSettings() {
+    const provider = extensionSettings.provider || 'main';
+    $('#llm_provider_new').val(provider);
+    updateModelInputVisibility(provider);
+    $('#llm_model_new').val(extensionSettings.model || '');
+    $('#llm_max_tokens').val(extensionSettings.maxTokens || 1000);
+}
+
+function updateModelInputVisibility(provider) {
+    if (provider === 'main') {
+        $('#llm_direct_settings').hide();
+    } else {
+        $('#llm_direct_settings').show();
+        // oai_settings에서 현재 모델 힌트 표시 (값이 비어있을 때만)
+        if (!extensionSettings.model) {
+            const field = PROVIDER_MODEL_FIELD[provider];
+            if (field && oai_settings[field]) {
+                $('#llm_model_new').attr('placeholder', `현재: ${oai_settings[field]}`);
+            }
+        }
+    }
+}
+
+function registerProviderEventHandlers() {
+    $('#llm_provider_new').on('change', function () {
+        const provider = $(this).val();
+        extensionSettings.provider = provider;
+        updateModelInputVisibility(provider);
+        saveSettingsDebounced();
+    });
+
+    $('#llm_model_new').on('input change', function () {
+        extensionSettings.model = $(this).val();
+        saveSettingsDebounced();
+    });
+
+    $('#llm_max_tokens').on('input change', function () {
+        extensionSettings.maxTokens = Number($(this).val()) || 1000;
+        saveSettingsDebounced();
+    });
+}
+
+// 기본 설정 로드, UI 초기화
+function loadSettings() {
+    migrateOldProviderSettings();
+
+    // 기본 설정 불러오기
+    for (const key in defaultSettings) {
+        if (!extensionSettings.hasOwnProperty(key)) {
+            extensionSettings[key] = defaultSettings[key];
+        }
+    }
+
+    // 설정 마이그레이션: auto_translate_on_swipe → auto_translate_new_messages
+    if (extensionSettings.hasOwnProperty('auto_translate_on_swipe') && !extensionSettings.hasOwnProperty('auto_translate_new_messages')) {
+        extensionSettings.auto_translate_new_messages = extensionSettings.auto_translate_on_swipe;
+        delete extensionSettings.auto_translate_on_swipe;
+        saveSettingsDebounced();
+    }
+
+    loadProviderSettings();
+    
+    // 숨겨진 텍스트 영역들에 각 프롬프트 값 설정
+    $('#llm_prompt_chat').val(extensionSettings.llm_prompt_chat);
+    $('#llm_prompt_retranslate_correction').val(extensionSettings.llm_prompt_retranslate_correction);
+    $('#llm_prompt_retranslate_guidance').val(extensionSettings.llm_prompt_retranslate_guidance);
+    $('#llm_prompt_retranslate_paragraph').val(extensionSettings.llm_prompt_retranslate_paragraph);
+    $('#llm_prompt_input').val(extensionSettings.llm_prompt_input);
+    $('#llm_prefill_content').val(extensionSettings.llm_prefill_content);
+
+    // 프리필 사용 여부 로드
+    $('#llm_prefill_toggle').prop('checked', extensionSettings.llm_prefill_toggle);
+
+    // 스로틀링 딜레이 값
+    $('#throttle_delay').val(extensionSettings.throttle_delay || '0');
+
+    // 체크박스 상태 설정 및 버튼 업데이트
+    $('#llm_translation_button_toggle').prop('checked', extensionSettings.show_input_translate_button);
+    updateInputTranslateButton();
+
+    // 새 메시지 자동 번역 체크박스 상태 설정
+    $('#auto_translate_new_messages').prop('checked', extensionSettings.auto_translate_new_messages);
+    $('#force_sequential_matching').prop('checked', extensionSettings.force_sequential_matching);
+
+    // 리버스 프록시 설정 로드
+    $('#llm_use_reverse_proxy').prop('checked', extensionSettings.use_reverse_proxy);
+    $('#llm_reverse_proxy_url').val(extensionSettings.reverse_proxy_url);
+    $('#llm_reverse_proxy_password').val(extensionSettings.reverse_proxy_password);
+
+    // 아이콘 표시/숨김 설정 로드
+    $('#hide_legacy_translate_button').prop('checked', extensionSettings.hide_legacy_translate_button);
+    $('#hide_toggle_button').prop('checked', extensionSettings.hide_toggle_button);
+    $('#hide_new_translate_button').prop('checked', extensionSettings.hide_new_translate_button);
+    $('#hide_paragraph_button').prop('checked', extensionSettings.hide_paragraph_button);
+    $('#hide_edit_button').prop('checked', extensionSettings.hide_edit_button);
+    $('#hide_delete_button').prop('checked', extensionSettings.hide_delete_button);
+
+    const displayMode = extensionSettings.translation_display_mode || defaultSettings.translation_display_mode;
+    $('#translation_display_mode').val(displayMode);
+    
+    // 규칙 프롬프트 로드
+    loadRulePrompt();
+
+    // 프롬프트 선택 상태 복원
+    if (promptManager) {
+        const savedPromptId = extensionSettings.selected_translation_prompt_id;
+        const promptSelect = document.getElementById('prompt_select');
+        
+        if (savedPromptId && promptSelect) {
+            promptSelect.value = savedPromptId;
+            const selectedPrompt = promptManager.getSelectedPrompt();
+            if (selectedPrompt) {
+                extensionSettings.selected_translation_prompt = selectedPrompt.content;
+                logDebug('Restored translation prompt:', selectedPrompt.title);
+            }
+        }
+        
+        // 텍스트 필드에 프롬프트 로드 (항상 실행)
+        promptManager.loadPromptToEditor();
+    }
+}
+
+// 규칙 프롬프트 관리 함수
+function loadRulePrompt() {
+    const context = getContext();
+    if (context && context.chatMetadata) {
+        const rulePrompt = context.chatMetadata[RULE_PROMPT_KEY] || '';
+        $('#llm_rule_prompt').val(rulePrompt);
+    }
+}
+
+function saveRulePrompt() {
+    const context = getContext();
+    if (context) {
+        if (!context.chatMetadata) {
+            context.chatMetadata = {};
+        }
+        const rulePrompt = $('#llm_rule_prompt').val();
+        context.chatMetadata[RULE_PROMPT_KEY] = rulePrompt;
+        saveMetadataDebounced();
+    }
+}
+
+// 리버스 프록시 설정 저장
+function saveReverseProxySettings() {
+    extensionSettings.use_reverse_proxy = $('#llm_use_reverse_proxy').is(':checked');
+    extensionSettings.reverse_proxy_url = $('#llm_reverse_proxy_url').val();
+    extensionSettings.reverse_proxy_password = $('#llm_reverse_proxy_password').val();
+    saveSettingsDebounced();
+}
+
+/**
+ * InputFeedback 방식의 API 호출 함수
+ * provider가 'main'이면 SillyTavern 현재 연결 모델 사용,
+ * 그 외엔 직접 chat-completions 엔드포인트 호출
+ */
+async function callDirectApi(fullPrompt) {
+    const provider  = extensionSettings.provider || 'main';
+    const model     = extensionSettings.model || '';
+    const maxTokens = Number(extensionSettings.maxTokens) || 1000;
+
+    // ── main: SillyTavern 현재 연결 모델 그대로 사용 ──
+    if (provider === 'main') {
+        const result = await generateRaw(fullPrompt, null, false, true);
+        if (!result) throw new Error('메인 API에서 응답을 받지 못했습니다.');
+        return result;
+    }
+
+    // ── 직접 호출 ──
+    const source = PROVIDER_SOURCE[provider] || provider;
+
+    const requestBody = {
+        chat_completion_source: source,
+        messages: [{ role: 'user', content: fullPrompt }],
+        model:      model,
+        max_tokens: maxTokens,
+        stream:     false,
+    };
+
+    // prefill (assistant pre-fill) 지원
+    if (extensionSettings.llm_prefill_toggle) {
+        let prefillContent = extensionSettings.llm_prefill_content || 'Understood. Here is my response:';
+        // 편집기 실시간 반영
+        const editorEl = document.getElementById('llm_prompt_editor');
+        const selectEl = document.getElementById('prompt_select');
+        if (editorEl && selectEl && selectEl.value === 'llm_prefill_content') {
+            const v = editorEl.value;
+            if (v && v.trim()) prefillContent = v;
+        }
+        const role = (source === 'makersuite' || source === 'vertexai') ? 'model' : 'assistant';
+        requestBody.messages.push({ role, content: prefillContent });
+    }
+
+    // Vertex AI 전용 파라미터
+    if (source === 'vertexai') {
+        requestBody.vertexai_auth_mode          = oai_settings.vertexai_auth_mode;
+        requestBody.vertexai_region             = oai_settings.vertexai_region;
+        requestBody.vertexai_express_project_id = oai_settings.vertexai_express_project_id;
+    }
+
+    // 리버스 프록시
+    if (extensionSettings.use_reverse_proxy) {
+        requestBody.reverse_proxy    = extensionSettings.reverse_proxy_url;
+        requestBody.proxy_password   = extensionSettings.reverse_proxy_password;
+    }
+
+    let response;
+    try {
+        response = await fetch('/api/backends/chat-completions/generate', {
+            method:  'POST',
+            headers: getRequestHeaders(),
+            body:    JSON.stringify(requestBody),
+        });
+    } catch (fetchError) {
+        throw new Error(`네트워크 연결 오류: ${fetchError.message}`);
+    }
+
+    if (!response.ok) {
+        let errorMessage = `HTTP ${response.status}`;
+        try {
+            const errorData = await response.json();
+            errorMessage = errorData?.error?.message || errorData?.message || response.statusText || errorMessage;
+        } catch (_) {
+            errorMessage = response.statusText || errorMessage;
+        }
+        switch (response.status) {
+            case 401: throw new Error('API 키가 잘못되었거나 권한이 없습니다.');
+            case 403: throw new Error('API 접근이 거부되었습니다.');
+            case 429: throw new Error('API 호출 한도를 초과했습니다. 잠시 후 다시 시도해주세요.');
+            case 500: throw new Error('서버 내부 오류가 발생했습니다.');
+            case 503: throw new Error('서비스를 사용할 수 없습니다. 잠시 후 다시 시도해주세요.');
+            default:  throw new Error(errorMessage);
+        }
+    }
+
+    const data = await response.json();
+
+    // 응답 텍스트 추출 (provider마다 구조가 다름)
+    const result =
+        data?.choices?.[0]?.message?.content?.trim() ||          // openai / claude / cohere (ST 래핑)
+        data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || // vertex raw (혹시 모를 경우)
+        data?.candidates?.[0]?.content?.trim() ||                 // makersuite ST 래핑
+        data?.content?.[0]?.text?.trim() ||                       // claude raw
+        data?.text?.trim() ||
+        '';
+
+    if (!result) throw new Error('번역 응답이 비어있습니다.');
+    return result;
+}
+
+// 통합된 번역 함수 (공식 스크립트 스타일)
+async function translate(text, options = {}) {
+    try {
+        if (!text || text.trim() === '') {
+            return '';
+        }
+
+        // 기본값 설정
+        const {
+            prompt = extensionSettings.llm_prompt_chat,
+            additionalGuidance = '',
+            isInputTranslation = false,
+            isRetranslation = false
+        } = options;
+
+        // 커스텀 프롬프트 적용 (실시간 텍스트필드 값 사용)
+        let finalPrompt = prompt;
+        
+        // 채팅 번역 프롬프트인 경우, 텍스트필드의 현재 값을 실시간 반영
+        if (prompt === extensionSettings.llm_prompt_chat) {
+            const editorElement = document.getElementById('llm_prompt_editor');
+            const selectElement = document.getElementById('prompt_select');
+            
+            // 텍스트필드의 현재 값을 사용 (저장하지 않아도 번역에 반영됨)
+            if (editorElement && selectElement) {
+                const selectedValue = selectElement.value;
+                const currentEditorValue = editorElement.value;
+                
+                // 1. 채팅 번역 프롬프트가 선택되어 있는 경우
+                if (selectedValue === 'llm_prompt_chat') {
+                    if (currentEditorValue && currentEditorValue.trim() !== '') {
+                        finalPrompt = currentEditorValue;
+                    }
+                }
+                // 2. 커스텀 프롬프트가 선택되어 있는 경우
+                else if (extensionSettings.selected_translation_prompt_id === selectedValue) {
+                    if (currentEditorValue && currentEditorValue.trim() !== '') {
+                        finalPrompt = currentEditorValue;
+                    }
+                }
+            }
+        }
+
+        // 규칙 프롬프트 처리
+        const context = getContext();
+        const rulePrompt = !isInputTranslation ? (context?.chatMetadata?.[RULE_PROMPT_KEY] || '') : '';
+        
+        let fullPrompt = finalPrompt;
+        if (rulePrompt.trim()) {
+            fullPrompt = `[Additional Rules]:\n${rulePrompt}\n\n${finalPrompt}`;
+        }
+        if (additionalGuidance.trim()) {
+            fullPrompt += `\n\n[Additional Guidance]:\n${additionalGuidance}`;
+        }
+        fullPrompt += `\n\n${text}`;
+
+        // API 호출 교체
+        return await callDirectApi(fullPrompt);
+
+    } catch (error) {
+        console.error('Translation error:', error);
+        if (error.message.includes('API 키') || error.message.includes('설정되어 있지 않습니다')) {
+            throw new Error(`API 키 설정 오류: ${error.message}`);
+        }
+        if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+            throw new Error('네트워크 연결 오류: 인터넷 연결을 확인해주세요.');
+        }
+        throw new Error(`번역 실패: ${error.message}`);
+    }
+}
+
+// 재번역 함수 (교정 또는 문단 맞추기)
+async function retranslateMessage(messageId, promptType, forceRetranslate = false) {
+    const context = getContext();
+    const message = context.chat[messageId];
+
+    if (!message) return;
+
+    if (typeof message.extra !== 'object') {
+        message.extra = {};
+    }
+
+    // 이미 번역 중인 경우
+    if (translationInProgress[messageId]) {
+        toastr.info('번역이 이미 진행 중입니다.');
+        return;
+    }
+
+    // promptType 검증
+    const validPromptTypes = ['correction', 'guidance', 'paragraph'];
+    if (!validPromptTypes.includes(promptType)) {
+        toastr.error('유효하지 않은 재번역 타입입니다.');
+        return;
+    }
+
+    const promptTypeKorean = promptType === 'correction' ? '교정' : promptType === 'guidance' ? '지침교정' : '문단 수 맞추기';
+    
+    // guidance 타입의 경우 추가 지침 입력받기
+    let additionalGuidance = '';
+    if (promptType === 'guidance') {
+        additionalGuidance = await callGenericPopup(
+            '추가 지침을 입력하세요:',
+            POPUP_TYPE.INPUT,
+            '',
+            { wide: false, large: false }
+        );
+        
+        if (additionalGuidance === false || additionalGuidance === null) {
+            toastr.info('지침교정이 취소되었습니다.');
+            return;
+        }
+        
+        if (!additionalGuidance.trim()) {
+            toastr.warning('추가 지침이 입력되지 않았습니다. 일반 교정으로 진행합니다.');
+            promptType = 'correction';
+        }
+    }
+    
+    toastr.info(`재번역(${promptTypeKorean})을 시작합니다 #${messageId}`);
+    translationInProgress[messageId] = true;
+
+    try {
+        const originalText = substituteParams(message.mes, context.name1, message.name);
+        const existingTranslation = await getTranslationFromDB(originalText);
+        
+        let textToRetranslate, prompt;
+        
+        if (existingTranslation) {
+            // 기존 번역이 있는 경우 - 재번역 수행
+            textToRetranslate = `[Original Text]:\n${originalText}\n\n[Translated Text]:\n${existingTranslation}`;
+            const promptMap = {
+                'correction': 'llm_prompt_retranslate_correction',
+                'guidance': 'llm_prompt_retranslate_guidance', 
+                'paragraph': 'llm_prompt_retranslate_paragraph'
+            };
+            const promptKey = promptMap[promptType];
+            
+            // 텍스트필드의 현재 값을 실시간 반영
+            const editorElement = document.getElementById('llm_prompt_editor');
+            const selectElement = document.getElementById('prompt_select');
+            if (editorElement && selectElement && selectElement.value === promptKey) {
+                const currentEditorValue = editorElement.value;
+                prompt = (currentEditorValue && currentEditorValue.trim() !== '') 
+                    ? currentEditorValue 
+                    : extensionSettings[promptKey];
+            } else {
+                prompt = extensionSettings[promptKey];
+            }
+        } else {
+            // 기존 번역이 없는 경우 - 새 번역 수행
+            toastr.warning(`기존 번역문이 없습니다. 새로 번역합니다.`);
+            textToRetranslate = originalText;
+            
+            // 채팅 번역 프롬프트도 텍스트필드 값 실시간 반영
+            const editorElement = document.getElementById('llm_prompt_editor');
+            const selectElement = document.getElementById('prompt_select');
+            if (editorElement && selectElement && selectElement.value === 'llm_prompt_chat') {
+                const currentEditorValue = editorElement.value;
+                prompt = (currentEditorValue && currentEditorValue.trim() !== '') 
+                    ? currentEditorValue 
+                    : extensionSettings.llm_prompt_chat;
+            } else {
+                prompt = extensionSettings.llm_prompt_chat;
+            }
+        }
+
+        const options = {
+            prompt,
+            additionalGuidance: promptType === 'guidance' ? additionalGuidance : '',
+            isRetranslation: true
+        };
+
+        const retranslation = await translate(textToRetranslate, options);
+        
+        // 결과 저장 및 UI 업데이트
+        await deleteTranslationByOriginalText(originalText);
+        await addTranslationToDB(originalText, retranslation);
+        message.extra.display_text = processTranslationText(originalText, retranslation);
+        // 현재 원문을 저장 (메시지 수정 시 이전 원문의 번역을 삭제하기 위해)
+        message.extra.original_text_for_translation = originalText;
+        
+        // 원문 표시 백업 초기화 (재번역했으므로)
+        delete message.extra.original_translation_backup;
+        
+        updateMessageBlock(messageId, message);
+        
+        // 번역문 표시 플래그 설정 (Font Manager 등 다른 확장과의 호환성을 위해)
+        // updateMessageBlock 후 DOM이 완전히 업데이트된 후 플래그 설정
+        setTimeout(() => {
+            const messageBlock = $(`#chat .mes[mesid="${messageId}"]`);
+            const textBlock = messageBlock.find('.mes_text');
+            textBlock.data('showing-original', false);
+        }, 100);
+        
+        await context.saveChat();
+        
+        toastr.success(`재번역(${promptTypeKorean}) 완료 #${messageId}`);
+        
+    } catch (error) {
+        console.error('Retranslation error:', error);
+        let errorMessage = '재번역에 실패했습니다.';
+        if (error.message) {
+            errorMessage = error.message;
+        }
+        toastr.error(`메시지 #${messageId} ${errorMessage}`, `재번역(${promptTypeKorean}) 실패`, { timeOut: 10000 });
+    } finally {
+        translationInProgress[messageId] = false;
+    }
+}
+
+// 단순화된 메시지 번역 함수
+async function translateMessage(messageId, forceTranslate = false, source = 'manual') {
+    const context = getContext();
+    const message = context.chat[messageId];
+
+    if (!message) {
+        return;
+    }
+
+    if (typeof message.extra !== 'object') {
+        message.extra = {};
+    }
+
+    // 번역 진행 중 확인
+    if (translationInProgress[messageId]) {
+        if (source === 'manual') {
+            toastr.info('번역이 이미 진행 중입니다.');
+        }
+        return;
+    }
+
+    translationInProgress[messageId] = true;
+
+    try {
+        const originalText = substituteParams(message.mes, context.name1, message.name);
+        
+        let showStartToast = false;
+        if (source === 'manual' || 
+            source === 'handleTranslateButtonClick' || 
+            source === 'handleTranslateButtonClick_retranslate') {
+            showStartToast = true;
+        } else if (source === 'auto' && !message.extra.display_text) {
+            const existingTranslation = await getTranslationFromDB(originalText);
+            if (!existingTranslation) {
+                showStartToast = true;
+            }
+        }
+        
+        if (showStartToast) {
+            toastr.info(`번역을 시작합니다 #${messageId}`);
+        }
+        
+        let shouldTranslate = forceTranslate || !message.extra.display_text;
+        
+        if (!shouldTranslate && source === 'auto' && message.extra.display_text) {
+            const cachedForCurrentText = await getTranslationFromDB(originalText);
+            if (!cachedForCurrentText) {
+                shouldTranslate = true;
+            }
+        }
+        
+        if (shouldTranslate) {
+            const cachedTranslation = await getTranslationFromDB(originalText);
+            
+            if (cachedTranslation) {
+                message.extra.display_text = processTranslationText(originalText, cachedTranslation);
+                message.extra.original_text_for_translation = originalText;
+                if (source !== 'auto') {
+                    toastr.info('IndexedDB에서 번역문을 가져왔습니다.');
+                }
+            } else {
+                const translation = await translate(originalText);
+                await addTranslationToDB(originalText, translation);
+                message.extra.display_text = processTranslationText(originalText, translation);
+            }
+            
+            message.extra.original_text_for_translation = originalText;
+            delete message.extra.original_translation_backup;
+            
+            updateMessageBlock(messageId, message);
+            
+            setTimeout(() => {
+                const messageBlock = $(`#chat .mes[mesid="${messageId}"]`);
+                const textBlock = messageBlock.find('.mes_text');
+                textBlock.data('showing-original', false);
+            }, 100);
+            
+            await context.saveChat();
+        }
+    } catch (error) {
+        console.error('Translation error:', error);
+        let errorMessage = '번역에 실패했습니다.';
+        if (error.message) {
+            errorMessage = error.message;
+        }
+        toastr.error(`메시지 #${messageId} ${errorMessage}`, '번역 실패', { timeOut: 10000 });
+    } finally {
+        translationInProgress[messageId] = false;
+    }
+}
+
+// 원문과 번역문 토글
+async function toggleOriginalText(messageId) {
+    const context = getContext();
+    const message = context.chat[messageId];
+    if (!message?.extra?.display_text) return;
+
+    const messageBlock = $(`#chat .mes[mesid="${messageId}"]`);
+    const textBlock = messageBlock.find('.mes_text');
+    const isCurrentlyShowingOriginal = textBlock.data('showing-original');
+
+    if (isCurrentlyShowingOriginal) {
+        if (message.extra.original_translation_backup) {
+            message.extra.display_text = message.extra.original_translation_backup;
+            delete message.extra.original_translation_backup;
+        }
+    } else {
+        if (!message.extra.original_translation_backup) {
+            message.extra.original_translation_backup = message.extra.display_text;
+        }
+        const originalText = substituteParams(message.mes, context.name1, message.name);
+        message.extra.display_text = originalText;
+    }
+
+    await updateMessageBlock(messageId, message);
+
+    setTimeout(() => {
+        const messageBlock = $(`#chat .mes[mesid="${messageId}"]`);
+        const textBlock = messageBlock.find('.mes_text');
+        textBlock.data('showing-original', !isCurrentlyShowingOriginal);
+    }, 100);
+}
+
+function isTranslationCurrentlyDisplayed(messageId) {
+    const context = getContext();
+    const message = context.chat[messageId];
+    
+    if (!message?.extra?.display_text) {
+        return false;
+    }
+    
+    const messageBlock = $(`#chat .mes[mesid="${messageId}"]`);
+    const textBlock = messageBlock.find('.mes_text');
+    const showingOriginalFlag = textBlock.data('showing-original');
+    
+    if (showingOriginalFlag === true) return false;
+    if (showingOriginalFlag === false) return true;
+    
+    const originalText = substituteParams(message.mes, context.name1, message.name);
+    const currentDisplayedHtml = textBlock.html();
+    
+    const tempDiv = $('<div>').html(currentDisplayedHtml);
+    tempDiv.find('[data-custom-tag-font]').each(function() {
+        $(this).replaceWith($(this).html());
+    });
+    
+    const currentDisplayedText = tempDiv.text().trim();
+    const originalTextTrimmed = originalText.trim();
+    
+    return currentDisplayedText !== originalTextTrimmed;
+}
+
+function validateAndNormalizeMessageId(messageIdStr) {
+    if (!messageIdStr) return 'last';
+    if (messageIdStr === 'last') return 'last';
+    const messageId = parseInt(messageIdStr, 10);
+    if (isNaN(messageId) || messageId < 0) return 'last';
+    
+    const context = getContext();
+    if (!context || !context.chat || context.chat.length === 0) return 'last';
+    if (messageId >= context.chat.length) return 'last';
+    return String(messageId);
+}
+
+function updateButtonVisibility() {
+    $('.mes_legacy_translate').toggle(!extensionSettings.hide_legacy_translate_button);
+    $('.mes_llm_translate').toggle(!extensionSettings.hide_new_translate_button);
+    $('.mes_toggle_original').toggle(!extensionSettings.hide_toggle_button);
+    $('.mes_paragraph_correction').toggle(!extensionSettings.hide_paragraph_button);
+    $('.mes_edit_translation').toggle(!extensionSettings.hide_edit_button);
+    $('.mes_delete_translation').toggle(!extensionSettings.hide_delete_button);
+}
+
+async function showOriginalText(messageId) {
+    const context = getContext();
+    const message = context.chat[messageId];
+    if (!message?.extra?.display_text) return;
+
+    if (!message.extra.original_translation_backup) {
+        message.extra.original_translation_backup = message.extra.display_text;
+    }
+
+    const originalText = substituteParams(message.mes, context.name1, message.name);
+    message.extra.display_text = originalText;
+
+    await updateMessageBlock(messageId, message);
+
+    setTimeout(() => {
+        const messageBlock = $(`#chat .mes[mesid="${messageId}"]`);
+        const textBlock = messageBlock.find('.mes_text');
+        textBlock.data('showing-original', true);
+    }, 100);
+}
+
+async function handleTranslateButtonClick(messageId) {
+    const context = getContext();
+    const message = context.chat[messageId];
+    
+    if (translationInProgress[messageId]) {
+        toastr.info('번역이 이미 진행 중입니다.');
+        return;
+    }
+    
+    if (!message?.extra?.display_text) {
+        await translateMessage(messageId, true, 'handleTranslateButtonClick');
+        return;
+    }
+    
+    const isShowingTranslation = isTranslationCurrentlyDisplayed(messageId);
+    
+    if (isShowingTranslation) {
+        await showOriginalText(messageId);
+        toastr.info(`원문으로 전환했습니다 #${messageId}`);
+    } else {
+        if (message.extra.original_translation_backup) {
+            message.extra.display_text = message.extra.original_translation_backup;
+            delete message.extra.original_translation_backup;
+            
+            await updateMessageBlock(messageId, message);
+            
+            setTimeout(() => {
+                const messageBlock = $(`#chat .mes[mesid="${messageId}"]`);
+                const textBlock = messageBlock.find('.mes_text');
+                textBlock.data('showing-original', false);
+            }, 100);
+            
+            toastr.info(`번역문으로 전환했습니다 #${messageId}`);
+        } else {
+            const messageBlock = $(`#chat .mes[mesid="${messageId}"]`);
+            const textBlock = messageBlock.find('.mes_text');
+            textBlock.data('showing-original', false);
+            
+            await translateMessage(messageId, true, 'handleTranslateButtonClick_retranslate');
+        }
+    }
+}
+
+async function onTranslateChatClick() {
+    if (isChatTranslationInProgress) {
+        isChatTranslationInProgress = false;
+        toastr.info('채팅 번역을 중단합니다.');
+        return;
+    }
+
+    const context = getContext();
+    const chat = context.chat;
+
+    if (!chat || chat.length === 0) {
+        toastr.warning('번역할 채팅이 없습니다.');
+        return;
+    }
+
+    const confirm = await callGenericPopup('전체 채팅을 번역하시겠습니까?', POPUP_TYPE.CONFIRM);
+    if (!confirm) return;
+
+    isChatTranslationInProgress = true;
+    const translateButton = $('#llm_translate_chat');
+    
+    translateButton.find('.fa-right-left').removeClass('fa-right-left').addClass('fa-stop-circle');
+    translateButton.find('span').text('번역 중단');
+    translateButton.addClass('translating');
+
+    toastr.info(`채팅 번역을 시작합니다. (${chat.length}개 메시지)`);
+
+    try {
+        const throttleDelay = parseInt(extensionSettings.throttle_delay) || 0;
+
+        for (let i = 0; i < chat.length && isChatTranslationInProgress; i++) {
+            await translateMessage(i, false, 'batch');
+            if (throttleDelay > 0) {
+                await new Promise(resolve => setTimeout(resolve, throttleDelay));
+            }
+        }
+
+        if (isChatTranslationInProgress) {
+            await context.saveChat();
+            toastr.success('채팅 번역이 완료되었습니다.');
+        }
+    } catch (error) {
+        console.error('Chat translation error:', error);
+        let errorMessage = '채팅 번역에 실패했습니다.';
+        if (error.message) {
+            errorMessage = error.message;
+        }
+        toastr.error(errorMessage, '채팅 번역 실패', { timeOut: 10000 });
+    } finally {
+        isChatTranslationInProgress = false;
+        translateButton.find('.fa-stop-circle').removeClass('fa-stop-circle').addClass('fa-right-left');
+        translateButton.find('span').text('LLM으로 전체 번역');
+        translateButton.removeClass('translating');
+    }
+}
+
+async function onTranslateInputMessageClick() {
+    const textarea = document.getElementById('send_textarea');
+
+    if (!(textarea instanceof HTMLTextAreaElement) || !textarea.value) {
+        toastr.warning('먼저 메시지를 입력하세요.');
+        return;
+    }
+
+    try {
+        let inputPrompt = extensionSettings.llm_prompt_input;
+        const editorElement = document.getElementById('llm_prompt_editor');
+        const selectElement = document.getElementById('prompt_select');
+        if (editorElement && selectElement && selectElement.value === 'llm_prompt_input') {
+            const currentEditorValue = editorElement.value;
+            if (currentEditorValue && currentEditorValue.trim() !== '') {
+                inputPrompt = currentEditorValue;
+            }
+        }
+        
+        const options = {
+            prompt: inputPrompt,
+            isInputTranslation: true
+        };
+        const translatedText = await translate(textarea.value, options);
+        textarea.value = translatedText;
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    } catch (error) {
+        console.error('Input translation error:', error);
+        let errorMessage = '입력 번역에 실패했습니다.';
+        if (error.message) {
+            errorMessage = error.message;
+        }
+        toastr.error(errorMessage, '입력 번역 실패', { timeOut: 10000 });
+    }
+}
+
+async function onTranslationsClearClick() {
+    const confirm = await callGenericPopup(
+        '번역된 내용을 모두 삭제하시겠습니까?',
+        POPUP_TYPE.CONFIRM
+    );
+
+    if (!confirm) {
+        return;
+    }
+
+    const context = getContext();
+    const chat = context.chat;
+
+    for (const mes of chat) {
+        if (mes.extra) {
+            delete mes.extra.display_text;
+        }
+    }
+
+    await context.saveChat();
+    await reloadCurrentChat();
+    toastr.success('번역된 내용이 삭제되었습니다.');
+}
+
+const createTranslateButtons = (mesBlock) => {
+    const messageId = mesBlock.attr('mesid');
+    const extraMesButtons = mesBlock.find('.extraMesButtons');
+
+    if (mesBlock.find('.mes_llm_translate').length > 0) {
+        return;
+    }
+
+    const legacyTranslateButton = $('<div>')
+        .addClass('mes_button mes_legacy_translate fa-solid fa-brain interactable')
+        .attr({
+            'title': 'LLM 번역 (기존)',
+            'data-i18n': '[title]LLM 번역 (기존)',
+            'tabindex': '0'
+        });
+
+    const newTranslateButton = $('<div>')
+        .addClass('mes_button mes_llm_translate fa-solid fa-right-left interactable')
+        .attr({
+            'title': 'LLM 번역/전환',
+            'data-i18n': '[title]LLM 번역/전환',
+            'tabindex': '0'
+        });
+
+    const toggleButton = $('<div>')
+        .addClass('mes_button mes_toggle_original fa-solid fa-magnifying-glass interactable')
+        .attr({
+            'title': '원문/번역 전환',
+            'data-i18n': '[title]원문/번역 전환',
+            'tabindex': '0'
+        });
+
+    const editButton = $('<div>')
+        .addClass('mes_button mes_edit_translation fa-solid fa-pen-to-square interactable')
+        .attr({
+            'title': '번역문 수정',
+            'data-i18n': '[title]번역문 수정',
+            'tabindex': '0'
+        });
+
+    const paragraphButton = $('<div>')
+        .addClass('mes_button mes_paragraph_correction fa-solid fa-wrench interactable')
+        .attr({
+            'title': '문단 수 교정',
+            'data-i18n': '[title]문단 수 교정',
+            'tabindex': '0'
+        });
+
+    const deleteButton = $('<div>')
+        .addClass('mes_button mes_delete_translation fa-solid fa-trash interactable')
+        .attr({
+            'title': '번역문 삭제',
+            'data-i18n': '[title]번역문 삭제',
+            'tabindex': '0'
+        });
+
+    if (extensionSettings.hide_legacy_translate_button) legacyTranslateButton.hide();
+    if (extensionSettings.hide_new_translate_button) newTranslateButton.hide();
+    if (extensionSettings.hide_toggle_button) toggleButton.hide();
+    if (extensionSettings.hide_paragraph_button) paragraphButton.hide();
+    if (extensionSettings.hide_edit_button) editButton.hide();
+    if (extensionSettings.hide_delete_button) deleteButton.hide();
+
+    extraMesButtons.prepend(deleteButton);
+    extraMesButtons.prepend(paragraphButton);
+    extraMesButtons.prepend(editButton);
+    extraMesButtons.prepend(toggleButton);
+    extraMesButtons.prepend(newTranslateButton);
+    extraMesButtons.prepend(legacyTranslateButton);
+};
+
+function addButtonsToExistingMessages() {
+    $('#chat .mes').each(function() {
+        const $this = $(this);
+        if (!$this.find('.mes_llm_translate').length) {
+            createTranslateButtons($this);
+        }
+    });
+}
+
+async function editTranslation(messageId) {
+    const context = getContext();
+    const message = context.chat[messageId];
+
+    if (!message?.extra?.display_text) {
+        toastr.warning('수정할 번역문이 없습니다.');
+        return;
+    }
+
+    const mesBlock = $(`.mes[mesid="${messageId}"]`);
+    const mesText = mesBlock.find('.mes_text');
+
+    const originalMessageText = substituteParams(message.mes, context.name1, message.name);
+    let originalDbTranslation;
+    try {
+        originalDbTranslation = await getTranslationFromDB(originalMessageText);
+        if (originalDbTranslation === null) {
+             toastr.error('오류: 화면에는 번역문이 있으나 DB에서 원본을 찾을 수 없습니다.');
+             return;
+        }
+    } catch (error) {
+        console.error("편집용 원본 번역문 DB 조회 실패:", error);
+        toastr.error("편집을 위해 원본 번역문을 가져오는 데 실패했습니다.");
+        return;
+    }
+    
+    mesBlock.addClass('translation-editing');
+    mesBlock.find('.mes_buttons').hide();
+
+    const editTextarea = $('<textarea>')
+        .addClass('edit_textarea translation_edit_textarea')
+        .val(originalDbTranslation);
+
+    const editButtons = $('<div>').addClass('translation_edit_buttons');
+    const saveButton = $('<div>')
+        .addClass('translation_edit_done interactable fa-solid fa-check-circle')
+        .attr('title', '저장');
+    const cancelButton = $('<div>')
+        .addClass('translation_edit_cancel interactable fa-solid fa-times-circle')
+        .attr('title', '취소');
+    editButtons.append(saveButton, cancelButton);
+
+    mesText.hide();
+    mesText.after(editTextarea);
+    editTextarea.before(editButtons);
+
+    cancelButton.on('click', function() {
+        editTextarea.remove();
+        editButtons.remove();
+        mesText.show();
+        mesBlock.removeClass('translation-editing');
+        mesBlock.find('.mes_buttons').show();
+    });
+
+    saveButton.on('click', async function() {
+        const newText = editTextarea.val();
+        const originalTextForDbKey = substituteParams(message.mes, context.name1, message.name);
+
+        if (newText.trim() === "") {
+            try {
+                await deleteTranslationByOriginalText(originalTextForDbKey);
+                message.extra.display_text = null;
+                await updateMessageBlock(messageId, message);
+                await context.saveChat();
+                toastr.success('번역문이 삭제되었습니다.');
+            } catch (e) {
+                toastr.error('번역문 삭제(DB)에 실패했습니다.');
+                 console.error(e);
+            }
+        }
+        else if (newText !== originalDbTranslation) {
+            try {
+                await updateTranslationByOriginalText(originalTextForDbKey, newText);
+                const processedNewText = processTranslationText(originalTextForDbKey, newText);
+                message.extra.display_text = processedNewText;
+                await updateMessageBlock(messageId, message);
+                await context.saveChat();
+                toastr.success('번역문이 수정되었습니다.');
+            } catch (e) {
+                toastr.error('번역문 수정 중 오류가 발생했습니다.');
+                console.error('번역문 수정 오류:', e);
+            }
+        } else {
+             toastr.info('번역 내용이 변경되지 않았습니다.');
+        }
+
+        editTextarea.remove();
+        editButtons.remove();
+        mesText.show();
+        mesBlock.removeClass('translation-editing');
+        mesBlock.find('.mes_buttons').show();
+    });
+
+    editTextarea.focus();
+}
+
+function updateInputTranslateButton() {
+    if (extensionSettings.show_input_translate_button) {
+        if ($('#llm_translate_input_button').length ===0) {
+            $.get(`${extensionFolderPath}/sendform.html`, function(data) {
+                $('#rightSendForm').append(data);
+                $('#llm_translate_input_button').off('click').on('click', onTranslateInputMessageClick);
+            });
+        }
+    } else {
+        $('#llm_translate_input_button').remove();
+    }
+}
+
+// jQuery 초기화 블록
+jQuery(async () => {
+    try {
+        const timestamp = Date.now();
+        const html = await $.get(`${extensionFolderPath}/index.html?v=${timestamp}`);
+        const buttonHtml = await $.get(`${extensionFolderPath}/buttons.html?v=${timestamp}`);
+
+        $('#translate_wand_container').append(buttonHtml);
+        $('#translation_container').append(html);
+
+        const cssLink = $('<link>', {
+            rel: 'stylesheet',
+            type: 'text/css',
+            href: `${extensionFolderPath}/style.css?v=${timestamp}`
+        });
+        $('head').append(cssLink);
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        promptManager = new PromptManager();
+        
+        loadSettings();
+        initializeEventHandlers();
+
+        logDebug('LLM Translator extension initialized successfully');
+    } catch (error) {
+        console.error('Error initializing LLM Translator extension:', error);
+    }
+});
+
+function isGeneratingSwipe(messageId) {
+    return $(`#chat .mes[mesid="${messageId}"] .mes_text`).text() === '...';
+}
+
+function shouldTranslate() {
+    return extensionSettings.auto_translate_new_messages;
+}
+
+function createEventHandler(translateFunction, shouldTranslateFunction) {
+    return (data) => {
+        if (shouldTranslateFunction()) {
+            translateFunction(data);
+        }
+    };
+}
+
+function translateIncomingMessage(messageId) {
+    const context = getContext();
+    const message = context.chat[messageId];
+    
+    if (!message || isGeneratingSwipe(messageId)) {
+        return;
+    }
+
+    if (typeof message.extra !== 'object') {
+        message.extra = {};
+    }
+
+    translateMessage(messageId, false, 'auto').catch(error => {
+        console.warn('Auto translation failed:', error);
+    });
+}
+
+function translateOutgoingMessage(messageId) {
+    const context = getContext();
+    const message = context.chat[messageId];
+
+    if (!message) {
+        return;
+    }
+
+    if (typeof message.extra !== 'object') {
+        message.extra = {};
+    }
+
+    translateMessage(messageId, false, 'auto').catch(error => {
+        console.warn('Auto translation failed:', error);
+    });
+}
+
+const handleIncomingMessage = createEventHandler(translateIncomingMessage, shouldTranslate);
+const handleOutgoingMessage = createEventHandler(translateOutgoingMessage, shouldTranslate);
+
+async function handleMessageEdit(messageId) {
+    const context = getContext();
+    const message = context.chat[messageId];
+    
+    if (!message) return;
+    
+    if (message.extra?.display_text) {
+        const currentOriginalText = substituteParams(message.mes, context.name1, message.name);
+        const previousOriginalText = message.extra.original_text_for_translation;
+        
+        if (previousOriginalText && previousOriginalText !== currentOriginalText) {
+            try {
+                await deleteTranslationByOriginalText(previousOriginalText);
+                logDebug(`Message ${messageId} was actually edited. Deleted translation for previous original text: "${previousOriginalText.substring(0, 50)}..."`);
+            } catch (error) {
+                if (error.message !== 'no matching data') {
+                    console.warn(`Failed to delete translation for previous original text:`, error);
+                }
+            }
+            
+            delete message.extra.display_text;
+            message.extra.original_text_for_translation = currentOriginalText;
+            updateMessageBlock(messageId, message);
+            
+            if (shouldTranslate()) {
+                setTimeout(() => {
+                    translateIncomingMessage(messageId);
+                }, 100);
+            }
+        } else if (previousOriginalText && previousOriginalText === currentOriginalText) {
+            logDebug(`Message ${messageId} edit button was clicked but no actual changes were made. Keeping translation data.`);
+        } else {
+            delete message.extra.display_text;
+            updateMessageBlock(messageId, message);
+            
+            if (shouldTranslate()) {
+                setTimeout(() => {
+                    translateIncomingMessage(messageId);
+                }, 100);
+            }
+        }
+    }
+}
+
+// 이벤트 핸들러 등록 함수
+function initializeEventHandlers() {
+    $(document).off('click', '.prompt-editor-button').on('click', '.prompt-editor-button', async function () {
+        const originalTextareaId = $(this).data('for');
+        const originalTextarea = $(`#${originalTextareaId}`);
+
+        if (!originalTextarea.length) {
+            console.error(`[LLM Translator] Could not find original textarea with id: ${originalTextareaId}`);
+            toastr.error('편집할 원본 텍스트 영역을 찾을 수 없습니다.');
+            return;
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.classList.add('height100p', 'wide100p', 'flex-container', 'flexFlowColumn');
+
+        const popupTextarea = document.createElement('textarea');
+        popupTextarea.dataset.for = originalTextareaId;
+        popupTextarea.value = originalTextarea.val();
+        popupTextarea.classList.add('height100p', 'wide100p');
+
+        popupTextarea.addEventListener('input', function () {
+            originalTextarea.val(popupTextarea.value).trigger('input');
+            if (originalTextareaId === 'llm_prompt_editor') {
+                const selectorElement = $('#prompt_select');
+                if (selectorElement.length > 0) {
+                    const selectedPromptKey = selectorElement.val();
+                    if (selectedPromptKey) {
+                        const customPrompt = promptManager.customPrompts.find(p => p.id === selectedPromptKey);
+                        if (customPrompt) {
+                            customPrompt.content = popupTextarea.value;
+                            promptManager.saveToLocalStorage();
+                        } else {
+                            extensionSettings[selectedPromptKey] = popupTextarea.value;
+                            $(`#${selectedPromptKey}`).val(popupTextarea.value);
+                        }
+                    }
+                }
+            }
+            saveSettingsDebounced();
+        });
+
+        wrapper.appendChild(popupTextarea);
+
+        try {
+            if (typeof callGenericPopup === 'function' && typeof POPUP_TYPE !== 'undefined' && POPUP_TYPE.TEXT) {
+                const popupTitle = $(this).attr('title') || '프롬프트 편집';
+                await callGenericPopup(wrapper, POPUP_TYPE.TEXT, popupTitle, { wide: true, large: true });
+                 $(this).focus();
+            } else {
+                console.error('[LLM Translator] callGenericPopup or POPUP_TYPE.TEXT is not available.');
+                toastr.error('SillyTavern의 팝업 기능을 사용할 수 없습니다.');
+            }
+        } catch (error) {
+            console.error('[LLM Translator] Error calling callGenericPopup:', error);
+            toastr.error('팝업을 여는 중 오류가 발생했습니다.');
+        }
+    });
+
+    $('#translation_display_mode').off('change').on('change', function() {
+        const selectedMode = $(this).val();
+        extensionSettings.translation_display_mode = selectedMode;
+        saveSettingsDebounced();
+    });
+
+    const deleteButton = document.getElementById("llm_translation_delete");
+    deleteButton.addEventListener("click", deleteDB);
+
+    const downloadButton = document.getElementById("llm_translation_download");
+    downloadButton.addEventListener("click", downloadDB);
+
+    const restoreButton = document.getElementById("llm_translation_restore");
+    restoreButton.addEventListener("change", function (event) {
+        const file = event.target.files[0];
+        if (file) restoreDB(file);
+    });
+   
+    $('#llm_translator_db_tool_setup_button').off('click').on('click', async function() {
+        await prepareQrAndCharacterForDbManagement();
+    });
+
+    $('#llm_translate_chat').on('click', onTranslateChatClick);
+    $('#llm_translate_input_message').on('click', onTranslateInputMessageClick);
+    $('#llm_translation_clear').on('click', onTranslationsClearClick);
+
+    // Provider 이벤트 핸들러 대체
+    registerProviderEventHandlers();
+
+    $('#llm_translation_button_toggle').on('change', function() {
+        extensionSettings.show_input_translate_button = $(this).is(':checked');
+        saveSettingsDebounced();
+        updateInputTranslateButton();
+    });
+
+    $('#auto_translate_new_messages').on('change', function() {
+        extensionSettings.auto_translate_new_messages = $(this).is(':checked');
+        saveSettingsDebounced();
+    });
+
+    $('#force_sequential_matching').on('change', function() {
+        extensionSettings.force_sequential_matching = $(this).is(':checked');
+        saveSettingsDebounced();
+    });
+
+    $('#llm_prefill_toggle').on('change', function() {
+        extensionSettings.llm_prefill_toggle = $(this).is(':checked');
+        saveSettingsDebounced();
+    });
+
+    $('#hide_legacy_translate_button, #hide_toggle_button, #hide_new_translate_button, #hide_paragraph_button, #hide_edit_button, #hide_delete_button').on('change', function() {
+        const setting = $(this).attr('id');
+        extensionSettings[setting] = $(this).is(':checked');
+        saveSettingsDebounced();
+        updateButtonVisibility();
+    });
+
+    eventSource.makeFirst(event_types.CHARACTER_MESSAGE_RENDERED, handleIncomingMessage);
+    eventSource.makeFirst(event_types.USER_MESSAGE_RENDERED, handleOutgoingMessage);
+    eventSource.on(event_types.MESSAGE_SWIPED, (messageId) => {
+        if (translationInProgress[messageId]) {
+            translationInProgress[messageId] = false;
+        }
+        
+        const context = getContext();
+        const message = context.chat[messageId];
+        if (message?.extra?.display_text) {
+            delete message.extra.display_text;
+            const messageBlock = $(`#chat .mes[mesid="${messageId}"]`);
+            const textBlock = messageBlock.find('.mes_text');
+            textBlock.removeData('showing-original');
+        }
+        
+        handleIncomingMessage(messageId);
+    });
+    eventSource.on(event_types.MESSAGE_UPDATED, handleMessageEdit);
+
+    if (!window.llmTranslatorObserver) {
+        window.llmTranslatorObserver = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+                mutation.addedNodes.forEach((node) => {
+                    if (node.classList?.contains('mes')) {
+                        const $node = $(node);
+                        if (!$node.find('.mes_llm_translate').length) {
+                            createTranslateButtons($node);
+                            setTimeout(() => updateButtonVisibility(), 10);
+                        }
+                    }
+                });
+            });
+        });
+
+        window.llmTranslatorObserver.observe(document.getElementById('chat'), {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    addButtonsToExistingMessages();
+    updateButtonVisibility();
+
+    $(document).on('click', '.mes .mes_legacy_translate', function() {
+        const messageId = $(this).closest('.mes').attr('mesid');
+        translateMessage(messageId, true, 'manual');
+    })
+    .on('click', '.mes .mes_llm_translate', function() {
+        const messageId = $(this).closest('.mes').attr('mesid');
+        handleTranslateButtonClick(messageId);
+    })
+    .on('click', '.mes .mes_toggle_original', function() {
+        const messageId = $(this).closest('.mes').attr('mesid');
+        toggleOriginalText(messageId);
+    })
+    .on('click', '.mes .mes_edit_translation', function() {
+        const messageId = $(this).closest('.mes').attr('mesid');
+        editTranslation(messageId);
+    })
+    .on('click', '.mes .mes_paragraph_correction', function() {
+        const messageId = $(this).closest('.mes').attr('mesid');
+        retranslateMessage(messageId, 'paragraph', true);
+    })
+    .on('click', '.mes .mes_delete_translation', function() {
+        const messageId = $(this).closest('.mes').attr('mesid');
+        deleteTranslationById(messageId).catch(error => {
+            console.error('Delete translation error:', error);
+            toastr.error('번역문 삭제 중 오류가 발생했습니다.');
+        });
+    });
+
+    eventSource.on(event_types.CHAT_CHANGED, function() {
+        setTimeout(() => {
+            addButtonsToExistingMessages();
+            updateButtonVisibility(); 
+            loadRulePrompt(); 
+        }, 100);
+    });
+
+    $('#throttle_delay').on('input change', function() {
+        extensionSettings.throttle_delay = $(this).val();
+        saveSettingsDebounced();
+    });
+
+    $('#llm_use_reverse_proxy, #llm_reverse_proxy_url, #llm_reverse_proxy_password').on('change input', function() {
+        saveReverseProxySettings();
+    });
+
+    $('#llm_reverse_proxy_password_show').on('click', function() {
+        const passwordInput = $('#llm_reverse_proxy_password');
+        const type = passwordInput.attr('type') === 'password' ? 'text' : 'password';
+        passwordInput.attr('type', type);
+        $(this).toggleClass('fa-eye-slash fa-eye');
+    });
+    
+    $('#llm_rule_prompt').on('input change', saveRulePrompt);
+
+    $(document).off('click', '.rule-prompt-editor-button').on('click', '.rule-prompt-editor-button', async function () {
+        const rulePromptTextarea = $('#llm_rule_prompt');
+
+        if (!rulePromptTextarea.length) {
+            console.error('[LLM Translator] Could not find rule prompt textarea');
+            toastr.error('규칙 프롬프트 텍스트 영역을 찾을 수 없습니다.');
+            return;
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.classList.add('height100p', 'wide100p', 'flex-container', 'flexFlowColumn');
+
+        const popupTextarea = document.createElement('textarea');
+        popupTextarea.value = rulePromptTextarea.val(); 
+        popupTextarea.classList.add('height100p', 'wide100p');
+
+        popupTextarea.addEventListener('input', function () {
+            rulePromptTextarea.val(popupTextarea.value).trigger('input');
+            
+            const context = getContext();
+            if (context) {
+                if (!context.chatMetadata) {
+                    context.chatMetadata = {};
+                }
+                context.chatMetadata[RULE_PROMPT_KEY] = popupTextarea.value;
+                saveMetadataDebounced();
+            }
+        });
+
+        wrapper.appendChild(popupTextarea);
+
+        try {
+            if (typeof callGenericPopup === 'function' && typeof POPUP_TYPE !== 'undefined' && POPUP_TYPE.TEXT) {
+                const popupTitle = '규칙 프롬프트 편집';
+                await callGenericPopup(wrapper, POPUP_TYPE.TEXT, popupTitle, { wide: true, large: true });
+                $(this).focus();
+            } else {
+                console.error('[LLM Translator] callGenericPopup or POPUP_TYPE.TEXT is not available.');
+                toastr.error('SillyTavern의 팝업 기능을 사용할 수 없습니다.');
+            }
+        } catch (error) {
+            console.error('[LLM Translator] Error calling callGenericPopup:', error);
+            toastr.error('팝업을 여는 중 오류가 발생했습니다.');
+        }
+    });
+}
+
+// IndexedDB 연결 함수
+function openDB() {
+  return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, 1);
+
+      request.onerror = (event) => {
+        reject(new Error("indexedDB open error"));
+      };
+
+      request.onsuccess = (event) => {
+        resolve(event.target.result);
+      };
+
+      request.onupgradeneeded = (event) => {
+          const db = event.target.result;
+          const objectStore = db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+          objectStore.createIndex('originalText', 'originalText', { unique: false });
+          objectStore.createIndex('provider', 'provider', { unique: false });
+          objectStore.createIndex('model', 'model', { unique: false });
+          objectStore.createIndex('date', 'date', { unique: false });
+        };
+  })
+}
+
+// 데이터 추가 함수 수정
+async function addTranslationToDB(originalText, translation) {
+    const db = await openDB();
+    const provider = extensionSettings.provider || 'main';
+    const model = extensionSettings.model || '';
+
+    const utcDate = new Date();
+    const koreanDate = new Date(utcDate.getTime() + (9 * 60 * 60 * 1000)); 
+    const date = koreanDate.toISOString();
+
+    return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+
+      const request = store.add({originalText:originalText, translation:translation, provider:provider, model:model, date:date});
+
+      request.onsuccess = (event) => {
+        resolve("add success");
+      };
+      request.onerror = (event) => {
+          reject(new Error("add error"));
+        };
+      transaction.oncomplete = function () {
+         db.close();
+      };
+  });
+}
+
+// 모든 데이터 가져오기
+async function getAllTranslationsFromDB() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(STORE_NAME, 'readonly');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.getAll();
+
+        request.onsuccess = (event) => {
+            resolve(event.target.result);
+        };
+        request.onerror = (event) => {
+          reject(new Error("get all error"));
+        };
+
+      transaction.oncomplete = function () {
+          db.close();
+      };
+    })
+}
+
+// 다운로드
+async function downloadDB() {
+    const data = await getAllTranslationsFromDB();
+    if (data && data.length > 0) {
+        const jsonData = JSON.stringify(data);
+        const blob = new Blob([jsonData], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+
+        const browserName = getBrowserName();
+
+        const now = new Date();
+        const formattedDate = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+
+        a.download = `${browserName}_SillyLLMtranslations_${formattedDate}.json`;
+
+        a.click();
+        URL.revokeObjectURL(url);
+    } else {
+        toastr.error('저장된 데이터가 없습니다.');
+    }
+}
+
+function getBrowserName() {
+   const userAgent = navigator.userAgent;
+    let browserName = 'Unknown';
+
+    if (userAgent.indexOf('Chrome') > -1) {
+        browserName = 'Chrome';
+    } else if (userAgent.indexOf('Firefox') > -1) {
+        browserName = 'Firefox';
+    } else if (userAgent.indexOf('Safari') > -1) {
+        browserName = 'Safari';
+    } else if (userAgent.indexOf('Edge') > -1) {
+        browserName = 'Edge';
+    } else if (userAgent.indexOf('Opera') > -1 || userAgent.indexOf('OPR') > -1) {
+        browserName = 'Opera';
+    }
+
+    return browserName;
+}
+
+//DB 복원
+async function restoreDB(file) {
+    const db = await openDB();
+    const reader = new FileReader();
+    reader.onload = async function (event) {
+        try {
+            const backupData = JSON.parse(event.target.result);
+             return new Promise(async (resolve, reject) => {
+              const transaction = db.transaction(STORE_NAME, 'readwrite');
+              const store = transaction.objectStore(STORE_NAME);
+
+                for (const item of backupData) {
+                    const index = store.index('originalText');
+                     const request = index.get(item.originalText);
+
+                     await new Promise((resolveGet) => {
+                        request.onsuccess = async (event) => {
+                           const record = event.target.result;
+                            if(record) {
+                                await new Promise((resolvePut)=>{
+                                  const updateRequest =  store.put({...record, translation:item.translation, provider:item.provider, model:item.model, date:item.date});
+                                  updateRequest.onsuccess = () => { resolvePut(); }
+                                  updateRequest.onerror = (e) => {
+                                    reject(new Error("restore put error"));
+                                    resolvePut();
+                                  }
+                                })
+                            } else {
+                                  await new Promise((resolveAdd)=>{
+                                     const addRequest = store.add(item);
+                                       addRequest.onsuccess = () => { resolveAdd(); }
+                                       addRequest.onerror = (e) => {
+                                          reject(new Error("restore add error"));
+                                          resolveAdd();
+                                       }
+                                   })
+                            }
+                            resolveGet();
+                        }
+                           request.onerror = (e) => {
+                                 reject(new Error("restore get error"));
+                                 resolveGet();
+                           }
+                     })
+                 }
+
+               transaction.oncomplete = function() {
+                db.close();
+                  toastr.success('데이터를 복원했습니다.');
+                  resolve();
+               }
+
+                transaction.onerror = function(event) {
+                  db.close();
+                  reject(new Error("restore transaction error"));
+                }
+            });
+           } catch (e) {
+             toastr.error("올바르지 않은 파일형식입니다.");
+         }
+    }
+    reader.readAsText(file);
+}
+
+// 데이터 업데이트 함수 수정
+async function updateTranslationByOriginalText(originalText, newTranslation) {
+  const db = await openDB();
+    const provider = extensionSettings.provider || 'main';
+    const model = extensionSettings.model || '';
+
+    const utcDate = new Date();
+    const koreanDate = new Date(utcDate.getTime() + (9 * 60 * 60 * 1000)); 
+   const date = koreanDate.toISOString();
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const index = store.index('originalText');
+    const request = index.get(originalText);
+
+    request.onsuccess = async (event) => {
+      const record = event.target.result;
+
+      if (record) {
+        const updateRequest = store.put({ ...record, translation: newTranslation, provider:provider, model:model, date:date });
+          updateRequest.onsuccess = () => {
+             resolve();
+           };
+         updateRequest.onerror = (e) => {
+            reject(new Error('put error'));
+           };
+      } else {
+        reject(new Error('no matching data'));
+      }
+    };
+   request.onerror = (e) => {
+      reject(new Error('get error'));
+    };
+    transaction.oncomplete = function () {
+      db.close();
+      };
+  });
+}
+
+// IndexedDB에서 번역 데이터 가져오는 함수
+async function getTranslationFromDB(originalText) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const index = store.index('originalText');
+      const request = index.get(originalText);
+
+      request.onsuccess = (event) => {
+          const record = event.target.result;
+          resolve(record ? record.translation : null);
+      };
+      request.onerror = (e) => {
+          reject(new Error("get error"));
+      };
+       transaction.oncomplete = function () {
+        db.close();
+      };
+  });
+}
+
+
+// IndexedDB 삭제 함수
+async function deleteDB() {
+    const confirm = await callGenericPopup(
+        '모든 번역 데이터를 삭제하시겠습니까?',
+        POPUP_TYPE.CONFIRM
+    );
+
+    if (!confirm) {
+        return;
+    }
+
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(DB_NAME);
+        request.onsuccess = () => {
+            toastr.success('모든 번역 데이터가 삭제되었습니다.');
+            resolve();
+        };
+        request.onerror = (event) => {
+            toastr.error('데이터 삭제에 실패했습니다.');
+            reject(new Error("db delete error"));
+        };
+    });
+}
+
+
+// IndexedDB 데이터 삭제 함수 (originalText 기반)
+async function deleteTranslationByOriginalText(originalText) {
+    const db = await openDB();
+     return new Promise((resolve, reject) => {
+         const transaction = db.transaction(STORE_NAME, 'readwrite');
+         const store = transaction.objectStore(STORE_NAME);
+         const index = store.index('originalText');
+         const request = index.get(originalText);
+
+         request.onsuccess = async (event) => {
+            const record = event.target.result;
+            if(record) {
+                const deleteRequest = store.delete(record.id);
+                 deleteRequest.onsuccess = () => {
+                    resolve();
+                 }
+                 deleteRequest.onerror = (e) => {
+                     reject(new Error('delete error'));
+                 }
+            } else {
+                  reject(new Error('no matching data'));
+             }
+          }
+           request.onerror = (e) => {
+            reject(new Error('get error'));
+         };
+          transaction.oncomplete = function () {
+              db.close();
+        };
+     })
+}
+
+function logDebug(...args) {
+    if (DEBUG_MODE) {
+        console.log(`[${extensionName} Debug]`, ...args);
+    }
+}
+
+async function backupTranslationsToMetadata() {
+    const DEBUG_PREFIX = `[${extensionName} - Backup]`;
+    if (isChatTranslationInProgress) {
+        toastr.warning('이미 백업 작업이 진행 중입니다.');
+        logDebug('Backup already in progress. Exiting.');
+        return;
+    }
+
+    try {
+        isChatTranslationInProgress = true;
+        toastr.info('번역 캐시 백업 시작... (데이터 양에 따라 시간이 걸릴 수 있습니다)');
+        logDebug('Starting backup to metadata...');
+
+        const context = getContext();
+        if (!context || !context.chatMetadata) {
+            throw new Error('컨텍스트 또는 메타데이터를 찾을 수 없습니다.');
+        }
+
+        logDebug('Context and metadata found.');
+
+        const allTranslations = await getAllTranslationsFromDB();
+
+        if (!allTranslations || allTranslations.length === 0) {
+            toastr.info('백업할 번역 데이터가 없습니다.');
+            logDebug('No translation data found in IndexedDB to back up.');
+            return; 
+        }
+        logDebug(`Retrieved ${allTranslations.length} translation items from IndexedDB.`);
+
+        const backupDataString = JSON.stringify(allTranslations);
+        logDebug(`Data stringified. Length: ${backupDataString.length} bytes.`);
+
+        if (typeof context.chatMetadata !== 'object' || context.chatMetadata === null) {
+            logDebug('chatMetadata is not an object, initializing.');
+            context.chatMetadata = {};
+        }
+        context.chatMetadata[METADATA_BACKUP_KEY] = backupDataString;
+        logDebug(`Stored backup string in chatMetadata under key: ${METADATA_BACKUP_KEY}`);
+
+        saveMetadataDebounced();
+        logDebug('saveMetadataDebounced() called to trigger server save.');
+
+        toastr.success(`번역 캐시 백업 완료! (${allTranslations.length}개 항목)`);
+        logDebug('Backup completed successfully.');
+
+    } catch (error) {
+        console.error(`${DEBUG_PREFIX} Error during backup:`, error);
+        toastr.error(`백업 중 오류 발생: ${error.message || '알 수 없는 오류'}`);
+    } finally {
+        isChatTranslationInProgress = false;
+        logDebug('Backup process finished.');
+    }
+}
+
+async function restoreTranslationsFromMetadata() {
+    const DEBUG_PREFIX = `[${extensionName} - Restore AddOnly Progress]`;
+    if (isChatTranslationInProgress) {
+        toastr.warning('이미 복원 작업이 진행 중입니다.');
+        logDebug('Restore already in progress. Exiting.');
+        return;
+    }
+
+    let progressContainer = null;
+    let progressBarInner = null;
+    let progressLabel = null;
+
+    try {
+        isChatTranslationInProgress = true;
+        logDebug('Starting restore from metadata (Add-Only mode)...');
+
+        const context = getContext();
+        if (!context || !context.chatMetadata) {
+            throw new Error('컨텍스트 또는 메타데이터를 찾을 수 없습니다.');
+        }
+        logDebug('Context and metadata found.');
+
+        const backupDataString = context.chatMetadata[METADATA_BACKUP_KEY];
+        if (!backupDataString || typeof backupDataString !== 'string') {
+            toastr.warning('현재 채팅에 저장된 번역 백업 데이터가 없습니다.');
+            logDebug(`No backup data found in metadata for key: ${METADATA_BACKUP_KEY}`);
+            return; 
+        }
+        logDebug(`Retrieved backup string from metadata. Length: ${backupDataString.length} bytes.`);
+
+        let backupData;
+        try {
+            backupData = JSON.parse(backupDataString);
+            if (!Array.isArray(backupData)) throw new Error('백업 데이터 형식이 올바르지 않습니다 (배열이 아님).');
+            logDebug(`Backup data parsed successfully. Items: ${backupData.length}`);
+        } catch (parseError) {
+            console.error(`${DEBUG_PREFIX} Error parsing backup data:`, parseError);
+            throw new Error('백업 데이터를 파싱하는 중 오류가 발생했습니다.');
+        }
+
+        const totalItems = backupData.length;
+        if (totalItems === 0) {
+            toastr.info('백업 데이터에 복원할 항목이 없습니다.');
+            logDebug('Backup data array is empty. Nothing to restore.');
+            return;
+        }
+        logDebug(`Starting restore process for ${totalItems} items.`);
+
+        logDebug('Creating progress bar UI...');
+        progressContainer = document.createElement('div');
+        progressContainer.id = 'llm-translator-progress-blocker';
+        progressContainer.style.position = 'fixed';
+        progressContainer.style.top = '0';
+        progressContainer.style.left = '0';
+        progressContainer.style.width = '100%';
+        progressContainer.style.height = '100%';
+        progressContainer.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+        progressContainer.style.zIndex = '10000';
+        progressContainer.style.display = 'flex';
+        progressContainer.style.justifyContent = 'center';
+        progressContainer.style.alignItems = 'center';
+
+        const progressContent = document.createElement('div');
+        progressContent.style.backgroundColor = '#333';
+        progressContent.style.padding = '20px';
+        progressContent.style.borderRadius = '8px';
+        progressContent.style.color = 'white';
+        progressContent.style.textAlign = 'center';
+        progressContent.style.minWidth = '300px';
+
+        const progressTitle = document.createElement('div');
+        progressTitle.textContent = '번역 캐시 복원 중...';
+        progressTitle.style.marginBottom = '15px';
+        progressTitle.style.fontSize = '1.2em';
+
+        const progressBarOuter = document.createElement('div');
+        progressBarOuter.style.backgroundColor = '#555';
+        progressBarOuter.style.borderRadius = '5px';
+        progressBarOuter.style.overflow = 'hidden';
+        progressBarOuter.style.height = '20px';
+        progressBarOuter.style.marginBottom = '10px';
+        progressBarOuter.style.position = 'relative';
+
+        progressBarInner = document.createElement('div');
+        progressBarInner.style.backgroundColor = '#4CAF50';
+        progressBarInner.style.height = '100%';
+        progressBarInner.style.width = '0%';
+        progressBarInner.style.transition = 'width 0.1s linear';
+
+        progressLabel = document.createElement('div');
+        progressLabel.textContent = `0 / ${totalItems} (0%)`;
+        progressLabel.style.fontSize = '0.9em';
+
+        progressBarOuter.appendChild(progressBarInner);
+        progressContent.appendChild(progressTitle);
+        progressContent.appendChild(progressBarOuter);
+        progressContent.appendChild(progressLabel);
+        progressContainer.appendChild(progressContent);
+        document.body.appendChild(progressContainer);
+        logDebug('Progress bar UI created and appended to body.');
+
+        let addedCount = 0;
+        let skippedCount = 0;
+        let errorCount = 0;
+
+        for (let i = 0; i < totalItems; i++) {
+            const item = backupData[i];
+            const currentProgress = i + 1;
+
+            const progressPercentage = (currentProgress / totalItems) * 100;
+            progressBarInner.style.width = `${progressPercentage}%`;
+            progressLabel.textContent = `${currentProgress} / ${totalItems} (${Math.round(progressPercentage)}%)`;
+
+            if (i > 0 && i % 100 === 0) {
+                 logDebug(`Restore progress: ${currentProgress}/${totalItems} (${Math.round(progressPercentage)}%)`);
+                 await new Promise(resolve => setTimeout(resolve, 0));
+            }
+
+            if (!item || typeof item.originalText !== 'string' || typeof item.translation !== 'string') {
+                logDebug(`Skipping invalid item at index ${i}:`, item);
+                errorCount++; 
+                continue;
+            }
+
+            try {
+                const localTranslationExists = await getTranslationFromDB(item.originalText) !== null;
+
+                if (!localTranslationExists) {
+                    await addTranslationToDB(item.originalText, item.translation);
+                    addedCount++;
+                } else {
+                    skippedCount++;
+                }
+            } catch (dbError) {
+                console.error(`${DEBUG_PREFIX} Error processing item at index ${i} (original: ${item.originalText.substring(0, 50)}...):`, dbError);
+                errorCount++;
+            }
+        }
+
+        logDebug(`Restore (Add-Only) completed. Added: ${addedCount}, Skipped (Existing): ${skippedCount}, Errors: ${errorCount}`);
+        if (errorCount > 0) {
+            toastr.warning(`복원 완료. ${addedCount}개 추가, ${skippedCount}개 건너뜀. ${errorCount}개 오류 발생.`);
+        } else {
+            toastr.success(`번역 캐시 복원 완료! (${addedCount}개 추가, ${skippedCount}개 건너뜀)`);
+        }
+
+        logDebug('Metadata backup was NOT automatically cleared after restore (as requested).');
+
+    } catch (error) {
+        console.error(`${DEBUG_PREFIX} Error during restore:`, error);
+        toastr.error(`복원 중 오류 발생: ${error.message || '알 수 없는 오류'}`);
+    } finally {
+        if (progressContainer && document.body.contains(progressContainer)) {
+             logDebug('Removing progress bar UI.');
+             document.body.removeChild(progressContainer);
+        } else {
+             logDebug('Progress bar UI was not found or already removed.');
+        }
+        isChatTranslationInProgress = false;
+        logDebug('Restore process finished.');
+    }
+}
+
+async function clearBackupFromMetadata() {
+    const DEBUG_PREFIX = `[${extensionName} - Cleanup]`;
+    if (isChatTranslationInProgress) {
+        toastr.warning('이미 정리 작업이 진행 중입니다.');
+        logDebug('Cleanup already in progress. Exiting.');
+        return;
+    }
+
+    logDebug('Requesting metadata backup cleanup...');
+    const confirm = await callGenericPopup(
+        '현재 채팅에 저장된 번역 캐시 백업을 삭제하시겠습니까?\n(주의: 복구할 수 없습니다!)',
+        POPUP_TYPE.CONFIRM
+    );
+
+    if (!confirm) {
+        logDebug('Metadata cleanup cancelled by user.');
+        toastr.info('백업 데이터 삭제가 취소되었습니다.');
+        return;
+    }
+    logDebug('User confirmed metadata cleanup.');
+
+    try {
+        isChatTranslationInProgress = true;
+        toastr.info('백업 데이터 삭제 시작...');
+        logDebug('Starting cleanup of metadata backup...');
+
+        const context = getContext();
+        if (!context || !context.chatMetadata) {
+            throw new Error('컨텍스트 또는 메타데이터를 찾을 수 없습니다.');
+        }
+        logDebug('Context and metadata found.');
+
+        if (context.chatMetadata.hasOwnProperty(METADATA_BACKUP_KEY)) {
+            logDebug(`Found backup data under key: ${METADATA_BACKUP_KEY}. Deleting...`);
+            delete context.chatMetadata[METADATA_BACKUP_KEY]; 
+            saveMetadataDebounced(); 
+            logDebug('saveMetadataDebounced() called to trigger server save.');
+            toastr.success('채팅에 저장된 번역 캐시 백업이 삭제되었습니다.');
+        } else {
+            logDebug(`No backup data found under key: ${METADATA_BACKUP_KEY}. Nothing to delete.`);
+            toastr.info('현재 채팅에 삭제할 번역 캐시 백업이 없습니다.');
+        }
+        logDebug('Cleanup completed successfully.');
+
+    } catch (error) {
+        console.error(`${DEBUG_PREFIX} Error during cleanup:`, error);
+        toastr.error(`백업 데이터 삭제 중 오류 발생: ${error.message || '알 수 없는 오류'}`);
+    } finally {
+        isChatTranslationInProgress = false;
+        logDebug('Cleanup process finished.');
+    }
+}
+
+async function getTranslationById(messageIdStr) {
+    const DEBUG_PREFIX = `[${extensionName} - GetByID]`;
+    logDebug(`Attempting to get translation for message ID: ${messageIdStr}`);
+
+    const messageId = parseInt(messageIdStr, 10);
+    if (isNaN(messageId) || messageId < 0) {
+        const errorMsg = `유효하지 않은 메시지 ID: "${messageIdStr}". 숫자를 입력하세요.`;
+        logDebug(errorMsg);
+        return errorMsg;
+    }
+
+    const context = getContext();
+    if (!context || !context.chat) {
+        const errorMsg = '컨텍스트 또는 채팅 데이터를 찾을 수 없습니다.';
+        logDebug(errorMsg);
+        return `오류: ${errorMsg}`;
+    }
+    if (messageId >= context.chat.length) {
+        const errorMsg = `메시지 ID ${messageId}를 찾을 수 없습니다. (채팅 길이: ${context.chat.length})`;
+        logDebug(errorMsg);
+        return errorMsg;
+    }
+    const message = context.chat[messageId];
+    if (!message) {
+         const errorMsg = `메시지 ID ${messageId}에 대한 데이터를 가져올 수 없습니다.`;
+         logDebug(errorMsg);
+         return `오류: ${errorMsg}`;
+    }
+
+    const originalText = substituteParams(message.mes, context.name1, message.name);
+    if (!originalText) {
+         const errorMsg = `메시지 ID ${messageId}의 원본 텍스트를 가져올 수 없습니다.`;
+         logDebug(errorMsg);
+         return errorMsg;
+    }
+    logDebug(`Original text for message ID ${messageId} (used as DB key): "${originalText.substring(0, 50)}..."`);
+
+    try {
+        const translation = await getTranslationFromDB(originalText);
+        
+        if (translation) {
+            logDebug(`Translation found for message ID ${messageId}`);
+            return translation; 
+        } else {
+            const noTranslationMsg = `메시지 ID ${messageId}에 대한 번역문이 DB에 없습니다.`;
+            logDebug(noTranslationMsg);
+            return noTranslationMsg;
+        }
+
+    } catch (error) {
+         const errorMsg = `메시지 ID ${messageId}의 번역문 조회 중 오류가 발생했습니다.`;
+         console.error(`${DEBUG_PREFIX} Error getting translation for message ID ${messageId}:`, error);
+         return `오류: ${errorMsg}`;
+    }
+}
+
+function isMessageHidden(message) {
+    if (!message) return false;
+    return message.is_system === true;
+}
+
+async function getTranslationsInRange(startIdStr, endIdStr, includeOriginal = false, includeMessageId = false, excludeHidden = true) {
+    const DEBUG_PREFIX = `[${extensionName} - GetTranslationsInRange]`;
+    logDebug(`${DEBUG_PREFIX} Getting translations from ${startIdStr} to ${endIdStr}`);
+
+    let startId = parseInt(startIdStr, 10);
+    let endId = parseInt(endIdStr, 10);
+
+    if (isNaN(startId) || isNaN(endId) || startId < 0 || endId < 0) {
+        const errorMsg = `유효하지 않은 메시지 ID 범위: "${startIdStr}" ~ "${endIdStr}". 숫자를 입력하세요.`;
+        logDebug(errorMsg);
+        return errorMsg;
+    }
+
+    if (startId > endId) {
+        [startId, endId] = [endId, startId];
+        logDebug(`${DEBUG_PREFIX} Swapped range order: ${startId} to ${endId}`);
+    }
+
+    const context = getContext();
+    if (!context || !context.chat) {
+        const errorMsg = '컨텍스트 또는 채팅 데이터를 찾을 수 없습니다.';
+        logDebug(errorMsg);
+        return `오류: ${errorMsg}`;
+    }
+
+    const chatLength = context.chat.length;
+    if (startId >= chatLength) {
+        const errorMsg = `시작 메시지 ID ${startId}를 찾을 수 없습니다. (채팅 길이: ${chatLength})`;
+        logDebug(errorMsg);
+        return errorMsg;
+    }
+
+    if (endId >= chatLength) {
+        endId = chatLength - 1;
+        logDebug(`${DEBUG_PREFIX} Adjusted end ID to ${endId} (chat length: ${chatLength})`);
+    }
+
+    const results = [];
+    let translationCount = 0;
+    let originalCount = 0;
+    let hiddenCount = 0;
+
+    for (let messageId = startId; messageId <= endId; messageId++) {
+        const message = context.chat[messageId];
+        if (!message) {
+            logDebug(`${DEBUG_PREFIX} Message ${messageId} not found, skipping`);
+            continue;
+        }
+
+        if (excludeHidden && isMessageHidden(message)) {
+            logDebug(`${DEBUG_PREFIX} Message ${messageId} is hidden, skipping`);
+            hiddenCount++;
+            continue;
+        }
+
+        const originalText = substituteParams(message.mes, context.name1, message.name);
+        if (!originalText || originalText.trim() === '') {
+            logDebug(`${DEBUG_PREFIX} Message ${messageId} has empty content, skipping`);
+            continue;
+        }
+
+        try {
+            const translation = await getTranslationFromDB(originalText);
+            
+            if (translation && translation.trim() !== '') {
+                if (includeMessageId) {
+                    results.push(`[메시지 ${messageId}]`);
+                }
+                results.push(translation);
+                results.push(''); 
+                translationCount++;
+                logDebug(`${DEBUG_PREFIX} Found translation for message ${messageId}`);
+            } else if (includeOriginal) {
+                if (includeMessageId) {
+                    results.push(`[메시지 ${messageId} - 원문]`);
+                }
+                results.push(originalText);
+                results.push(''); 
+                originalCount++;
+                logDebug(`${DEBUG_PREFIX} Using original text for message ${messageId}`);
+            }
+        } catch (error) {
+            logDebug(`${DEBUG_PREFIX} Error getting translation for message ${messageId}:`, error);
+            if (includeOriginal) {
+                if (includeMessageId) {
+                    results.push(`[메시지 ${messageId} - 원문 (오류로 인한 대체)]`);
+                }
+                results.push(originalText);
+                results.push(''); 
+                originalCount++;
+            }
+        }
+    }
+
+    if (results.length === 0) {
+        const noResultMsg = `메시지 ID ${startId}~${endId} 범위에서 ${includeOriginal ? '텍스트' : '번역문'}를 찾을 수 없습니다.`;
+        logDebug(`${DEBUG_PREFIX} ${noResultMsg}`);
+        return noResultMsg;
+    }
+
+    const resultText = results.join('\n');
+    let summaryMsg = `메시지 ID ${startId}~${endId} 범위: 번역문 ${translationCount}개${includeOriginal ? `, 원문 ${originalCount}개` : ''}`;
+    if (excludeHidden && hiddenCount > 0) {
+        summaryMsg += `, 숨김 메시지 ${hiddenCount}개 제외`;
+    }
+    summaryMsg += ' 추출 완료';
+    logDebug(`${DEBUG_PREFIX} ${summaryMsg}`);
+    
+    return resultText;
+}
+
+async function deleteTranslationById(messageIdStr, swipeNumberStr) {
+    const DEBUG_PREFIX = `[${extensionName} - DeleteByID]`;
+    logDebug(`Attempting to delete translation for message ID: ${messageIdStr}`);
+
+    let actualMessageIdStr = messageIdStr;
+    if (messageIdStr === 'last') {
+        const context = getContext();
+        if (!context || !context.chat || context.chat.length === 0) {
+            const errorMsg = '채팅 메시지가 없습니다.';
+            logDebug(errorMsg);
+            toastr.error(errorMsg);
+            return errorMsg;
+        }
+        actualMessageIdStr = String(context.chat.length - 1);
+        logDebug(`'last' converted to messageId: ${actualMessageIdStr}`);
+    }
+
+    const messageId = parseInt(actualMessageIdStr, 10);
+    if (isNaN(messageId) || messageId < 0) {
+        const errorMsg = `유효하지 않은 메시지 ID: "${actualMessageIdStr}". 숫자를 입력하세요.`;
+        logDebug(errorMsg);
+        toastr.error(errorMsg);
+        return errorMsg;
+    }
+
+    const context = getContext();
+    if (!context || !context.chat) {
+        const errorMsg = '컨텍스트 또는 채팅 데이터를 찾을 수 없습니다.';
+        logDebug(errorMsg);
+        toastr.error(errorMsg);
+        return `오류: ${errorMsg}`;
+    }
+    if (messageId >= context.chat.length) {
+        const errorMsg = `메시지 ID ${messageId}를 찾을 수 없습니다. (채팅 길이: ${context.chat.length})`;
+        logDebug(errorMsg);
+        toastr.error(errorMsg);
+        return errorMsg;
+    }
+    const message = context.chat[messageId];
+    if (!message) {
+         const errorMsg = `메시지 ID ${messageId}에 대한 데이터를 가져올 수 없습니다.`;
+         logDebug(errorMsg);
+         toastr.error(errorMsg);
+         return `오류: ${errorMsg}`;
+    }
+
+    const originalText = substituteParams(message.mes, context.name1, message.name);
+    if (!originalText) {
+         const errorMsg = `메시지 ID ${messageId}의 원본 텍스트를 가져올 수 없습니다.`;
+         logDebug(errorMsg);
+         toastr.warning(errorMsg); 
+         return errorMsg;
+    }
+    logDebug(`Original text for message ID ${messageId} (used as DB key): "${originalText.substring(0, 50)}..."`);
+
+    if (swipeNumberStr && swipeNumberStr.trim() !== '') {
+        const swipeNumber = parseInt(swipeNumberStr, 10);
+        if (!isNaN(swipeNumber) && swipeNumber > 0) {
+            logDebug(`Swipe number ${swipeNumber} was provided, but swipe-specific deletion is not implemented yet.`);
+            toastr.warning(`스와이프 번호 ${swipeNumber}가 지정되었지만, 현재는 해당 메시지의 모든 번역 데이터를 삭제합니다.`);
+        } else {
+            logDebug(`Invalid swipe number: "${swipeNumberStr}". Ignoring and proceeding with full message deletion.`);
+        }
+    }
+
+    try {
+        await deleteTranslationByOriginalText(originalText); 
+
+        if (message.extra && message.extra.display_text) {
+            logDebug(`Removing display_text from message ${messageId} extra data.`);
+            delete message.extra.display_text; 
+            await updateMessageBlock(messageId, message); 
+            await context.saveChat(); 
+            logDebug('UI display_text removed and chat saved.');
+        } else {
+            logDebug(`No display_text found in message ${messageId} extra data to remove from UI.`);
+        }
+
+        const successMsg = `메시지 ID ${messageId}의 번역 데이터가 삭제되었습니다.`;
+        logDebug(successMsg);
+        toastr.success(successMsg);
+        return successMsg; 
+
+    } catch (error) {
+         let userErrorMessage = `메시지 ID ${messageId}의 번역 데이터 삭제 중 오류가 발생했습니다.`;
+         if (error && error.message && error.message.includes('no matching data')) {
+             userErrorMessage = `메시지 ID ${messageId}에 해당하는 번역 데이터가 DB에 없습니다.`;
+              logDebug(userErrorMessage);
+              toastr.info(userErrorMessage); 
+         } else {
+             console.error(`${DEBUG_PREFIX} Error deleting translation for message ID ${messageId}:`, error);
+             toastr.error(userErrorMessage);
+         }
+         return `오류: ${userErrorMessage}`; 
+    }
+}
+
+function doesCharacterExist(characterName) {
+    const context = getContext(); 
+    if (!context || !context.characters || !Array.isArray(context.characters)) {
+        return false;
+    }
+    const nameLower = characterName.toLowerCase();
+    return context.characters.some(char => char && typeof char.name === 'string' && char.name.toLowerCase() === nameLower);
+}
+
+async function createSillyTavernCharacter(characterName, firstMessage) {
+    const context = getContext(); 
+    if (!context) return false;
+
+    const characterData = {
+        name: characterName,
+        description: `LLM 번역 DB 작업을 위해 자동으로 생성된 캐릭터입니다.`,
+        personality: "",
+        scenario: "",
+        first_mes: firstMessage,
+        mes_example: "",
+        data: {
+            name: characterName,
+            description: `LLM 번역 DB 작업을 위해 자동으로 생성된 캐릭터입니다.`,
+            personality: "",
+            scenario: "",
+            first_mes: firstMessage,
+            mes_example: "",
+            tags: ["llm_translation_db_char", "auto-created"],
+            avatar: 'none',
+            alternate_greetings: [],
+        },
+        avatar: 'none',
+        tags: ["llm_translation_db_char", "auto-created"],
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+    };
+
+    const formData = new FormData();
+    formData.append('avatar', new Blob([JSON.stringify(characterData)], { type: 'application/json' }), `${characterName}.json`);
+    formData.append('file_type', 'json');
+
+    const headers = context.getRequestHeaders ? context.getRequestHeaders() : {};
+    if (headers['Content-Type']) {
+        delete headers['Content-Type'];
+    }
+
+    try {
+        const response = await fetch('/api/characters/import', {
+            method: 'POST',
+            headers: headers,
+            body: formData,
+            cache: 'no-cache',
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`DB_TOOL_SETUP 캐릭터 '${characterName}' 가져오기 실패. 상태: ${response.status} - ${response.statusText}. 본문: ${errorText}`);
+            if (window.toastr) toastr.error(`캐릭터 '${characterName}' 생성 실패: ${response.statusText}`);
+            return false;
+        }
+
+        if (typeof context.getCharacters === 'function') {
+            await context.getCharacters();
+        }
+
+        if (window.toastr) toastr.success(`캐릭터 "${characterName}"이(가) 성공적으로 생성되었습니다!`);
+        return true;
+
+    } catch (error) {
+        console.error(`DB_TOOL_SETUP 캐릭터 "${characterName}" 생성 중 API 오류 발생:`, error);
+        if (window.toastr) toastr.error(`캐릭터 '${characterName}' 생성 중 오류: ${error.message || error}`);
+        return false;
+    }
+}
+
+function getQuickReplyApi() {
+    if (!window.quickReplyApi) {
+        console.error(`DB_TOOL_SETUP QuickReply API를 찾을 수 없습니다. QuickReply 확장이 설치 및 활성화되어 있는지 확인해주세요.`);
+        if (window.toastr) toastr.error('QuickReply API를 사용할 수 없습니다. 관련 확장을 확인해주세요.');
+        return null;
+    }
+    return window.quickReplyApi;
+}
+
+function getFirstActiveGlobalQuickReplySetName() {
+  const quickReplyApi = getQuickReplyApi();
+  if (!quickReplyApi || !quickReplyApi.settings || !quickReplyApi.settings.config || !Array.isArray(quickReplyApi.settings.config.setList)) {
+    return null;
+  }
+
+  const setList = quickReplyApi.settings.config.setList;
+  const firstActiveSetItem = setList.find(item => item && item.isVisible === true);
+
+  if (firstActiveSetItem && firstActiveSetItem.set && typeof firstActiveSetItem.set.name === 'string' && firstActiveSetItem.set.name.trim() !== '') {
+    return firstActiveSetItem.set.name;
+  } else {
+    if (window.toastr && !firstActiveSetItem) toastr.info("활성화된 전역 Quick Reply 세트가 없습니다. QR 생성을 위해 먼저 세트를 활성화해주세요.");
+    else if (window.toastr) toastr.warning("활성 QR 세트는 찾았으나, 유효한 이름이 없습니다.");
+    return null;
+  }
+}
+
+async function ensureQuickReplyExists(setName, qrLabel, qrCommandString, qrTitle) {
+    const quickReplyApi = getQuickReplyApi();
+    if (!quickReplyApi) return false;
+
+    let qrExists = !!quickReplyApi.getQrByLabel(setName, qrLabel);
+
+    if (qrExists) {
+        return true;
+    }
+
+    const qrProperties = {
+        message: qrCommandString,
+        icon: '',
+        showLabel: false,
+        title: qrTitle,
+        isHidden: false,
+        executeOnStartup: false,
+        executeOnUser: false,
+        executeOnAi: false,
+        executeOnChatChange: false,
+        executeOnGroupMemberDraft: false,
+        executeOnNewChat: false,
+        automationId: '',
+    };
+
+    try {
+        quickReplyApi.createQuickReply(setName, qrLabel, qrProperties);
+        if (window.toastr) toastr.info(`QR '${qrLabel}'이(가) 세트 '${setName}'에 생성되었습니다.`);
+        return true;
+    } catch (error) {
+        console.error(`DB_TOOL_SETUP QR '${qrLabel}' 생성 중 오류:`, error);
+        if (window.toastr) toastr.error(`QR '${qrLabel}' 생성 중 오류가 발생했습니다: ${error.message}`);
+        return false;
+    }
+}
+
+async function ensureCharacterExists(characterName, firstMessage) {
+    let charExists = doesCharacterExist(characterName);
+
+    if (charExists) {
+        return true;
+    }
+
+    if (window.toastr) toastr.info(`필요한 캐릭터 '${characterName}'을(를) 찾을 수 없습니다. 생성을 시도합니다...`);
+    
+    const creationSuccess = await createSillyTavernCharacter(characterName, firstMessage);
+    if (creationSuccess) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+async function prepareQrAndCharacterForDbManagement() {
+    const targetCharName = "llm번역DB백업용";
+    const targetCharFirstMessage = `LLM 번역 DB 관리 캐릭터입니다. 다음 명령어를 사용할 수 있습니다:\n\n채팅 백업(업로드)\n/llmDBUploadBackup\n\n채팅 복원(다운로드+등록된 DB삭제)\n/llmDBDownloadRestore | /llmDBmetaClearBackup`;
+
+    const qrLabel = 'llm번역DB관리';
+    const qrTitle = 'LLM 번역 DB 관리';
+    const qrCommandString = `
+/let mainMenu {:
+    /buttons labels=["(업로드)백업", "(다운로드)복원"] -LLM 번역 DB 관리-<br><br>어떤 작업을 하시겠습니까? |
+    /let choice {{pipe}} |
+
+    /if left={{var::choice}} right="(업로드)백업" rule=eq /:llmDBUpload |
+    /if left={{var::choice}} right="(다운로드)복원" rule=eq /:llmDBDownload |
+    /if left={{var::choice}} right="" rule=eq {: /abort :} |
+    /:mainMenu | 
+:} |
+
+/let llmDBUpload {:
+    /go ${targetCharName} | /delay 1000 | /llmDBUploadBackup |
+    /abort |
+:} |
+
+/let llmDBDownload {:
+    /go ${targetCharName} | /llmDBDownloadRestore | /llmDBmetaClearBackup |
+    /abort |
+:} |
+
+/:mainMenu |
+    `.trim();
+
+    try {
+        const activeQrSetName = getFirstActiveGlobalQuickReplySetName();
+        if (!activeQrSetName) {
+            if (window.toastr) toastr.error("활성화된 전역 QR 세트를 찾을 수 없습니다. QR 관련 작업을 진행할 수 없습니다.");
+            return;
+        }
+
+        const quickReplyApi = getQuickReplyApi(); 
+        const initialQrExists = quickReplyApi ? !!quickReplyApi.getQrByLabel(activeQrSetName, qrLabel) : false;
+        const initialCharExists = doesCharacterExist(targetCharName);
+
+        let qrReady = await ensureQuickReplyExists(activeQrSetName, qrLabel, qrCommandString, qrTitle);
+        let charReady = await ensureCharacterExists(targetCharName, targetCharFirstMessage);
+        
+        let qrCreatedThisTime = qrReady && !initialQrExists;
+        let charCreatedThisTime = charReady && !initialCharExists;
+        let actionTakenThisTime = qrCreatedThisTime || charCreatedThisTime;
+
+        if (qrReady && charReady) {
+            if (actionTakenThisTime) {
+                let message = "DB 관리 기능 설정 진행: ";
+                if (qrCreatedThisTime && charCreatedThisTime) message += `QR '${qrLabel}' 및 캐릭터 '${targetCharName}'이(가) 준비되었습니다.`;
+                else if (qrCreatedThisTime) message += `QR '${qrLabel}'이(가) 준비되었습니다.`;
+                else if (charCreatedThisTime) message += `캐릭터 '${targetCharName}'이(가) 준비되었습니다.`;
+                message += " 버튼을 다시 클릭하여 작업을 시작하세요.";
+                if (window.toastr) toastr.success(message);
+            } else {
+                const readyMessage = `DB 관리 기능('${qrLabel}' QR, '${targetCharName}' 캐릭터) 사용 준비가 완료되었습니다. 버튼을 다시 클릭하여 작업을 시작하세요.`;
+                if (window.toastr) toastr.info(readyMessage);
+            }
+        } else {
+            let failMessage = "DB 관리 기능 설정 실패: ";
+            if (!qrReady) failMessage += `QR '${qrLabel}' 준비에 실패했습니다. `;
+            if (!charReady) failMessage += `캐릭터 '${targetCharName}' 준비에 실패했습니다.`;
+            if (window.toastr) toastr.error(failMessage);
+            console.error(`DB_TOOL_SETUP ${failMessage}`);
+        }
+
+    } catch (ex) {
+        console.error(`DB 관리 기능 준비 중 예외 발생 ('${qrLabel}'):`, ex);
+        if (window.toastr) toastr.error(`작업 중 오류가 발생했습니다: ${ex.message}`);
+    }
+}
+
+function correctBackticks(input) {
+    if (typeof input !== 'string' || input === null) {
+        return input;
+    }
+
+    let correctedInput = input.replace(/`{2,}/g, '`');
+    const backtickCount = (correctedInput.match(/`/g) || []).length;
+
+    if (backtickCount % 2 !== 0) {
+        correctedInput += '`';
+    }
+
+    return correctedInput;
+}
+
+function processTranslationText(originalText, translatedText) {
+    const displayMode = extensionSettings.translation_display_mode || 'disabled'; 
+
+    if (displayMode === 'disabled') {
+        return translatedText || '';
+    }
+
+    if (!translatedText) {
+         return '';
+    }
+
+    try {
+        const specialBlockRegexes = [
+            /<think>[\s\S]*?<\/think>/gi,
+            /<thinking>[\s\S]*?<\/thinking>/gi,
+            /<tableEdit>[\s\S]*?<\/tableEdit>/gi,
+            /<details[^>]*>[\s\S]*?<\/details>/gi,
+            /`{3,}[^`]*[\s\S]*?`{3,}/g  
+        ];
+        
+        try {
+            const fontManagerSettings = localStorage.getItem('font-manager-settings');
+            
+            if (fontManagerSettings) {
+                const parsedSettings = JSON.parse(fontManagerSettings);
+                
+                const currentPresetId = parsedSettings?.currentPreset;
+                const presets = parsedSettings?.presets || [];
+                const currentPreset = presets.find(p => p.id === currentPresetId);
+                
+                const customTags = currentPreset?.customTags ?? parsedSettings?.customTags ?? [];
+                
+                customTags.forEach(tag => {
+                    if (tag.tagName) {
+                        const escapedTagName = tag.tagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        const tagRegex = new RegExp(`<${escapedTagName}[^>]*>([\\s\\S]*?)</${escapedTagName}>`, 'gi');
+                        specialBlockRegexes.push(tagRegex);
+                    }
+                });
+            }
+        } catch (error) {
+            console.error('[LLM-Translator] Failed to load Font Manager custom tags:', error);
+        }
+        
+        const placeholderPrefix = '__LLM_TRANSLATOR_SPECIAL_BLOCK_';
+        const placeholderSuffix = '__';
+        const placeholderRegexGlobal = new RegExp(placeholderPrefix + '\\d+' + placeholderSuffix, 'g');
+        const placeholderRegexSingle = new RegExp('^' + placeholderPrefix + '\\d+' + placeholderSuffix + '$');
+        const specialBlocksMap = {};
+        let placeholderIndex = 0;
+        let textWithPlaceholders = originalText || '';
+
+        specialBlockRegexes.forEach(regex => {
+            textWithPlaceholders = textWithPlaceholders.replace(regex, (match) => {
+                const placeholder = `${placeholderPrefix}${placeholderIndex}${placeholderSuffix}`;
+                specialBlocksMap[placeholder] = match;
+                placeholderIndex++;
+                return placeholder;
+            });
+        });
+
+        let translatedWithPlaceholders = translatedText || '';
+        let translatedPlaceholderIndex = 0;
+        const translatedBlocksMap = {};
+        
+        specialBlockRegexes.forEach(regex => {
+            translatedWithPlaceholders = translatedWithPlaceholders.replace(regex, (match) => {
+                const placeholder = `${placeholderPrefix}TRANSLATED_${translatedPlaceholderIndex}${placeholderSuffix}`;
+                translatedBlocksMap[placeholder] = match;
+                translatedPlaceholderIndex++;
+                return placeholder;
+            });
+        });
+
+        let processedTextWithPlaceholders = (textWithPlaceholders || '').replace(/<br\s*\/?>/gi, '\n').trim();
+        let processedTranslated = (translatedWithPlaceholders || '').replace(/<br\s*\/?>/gi, '\n').trim();
+        let proseOnlyOriginalText = processedTextWithPlaceholders.replace(placeholderRegexGlobal, '').trim();
+        
+        const translatedPlaceholderRegex = new RegExp(placeholderPrefix + 'TRANSLATED_\\d+' + placeholderSuffix, 'g');
+        const translatedPlaceholderRegexSingle = new RegExp('^' + placeholderPrefix + 'TRANSLATED_\\d+' + placeholderSuffix + '$');
+        let proseOnlyTranslatedText = processedTranslated.replace(translatedPlaceholderRegex, '').trim();
+
+        const templateLines = processedTextWithPlaceholders.split('\n').map(line => line.trim());
+        const translatedTemplateLines = processedTranslated.split('\n').map(line => line.trim()); 
+        const proseOriginalLines = proseOnlyOriginalText.split('\n').map(line => line.trim()).filter(line => line !== '');
+        const translatedLines = proseOnlyTranslatedText.split('\n').map(line => line.trim()).filter(line => line !== '');
+
+        const forceSequentialMatching = extensionSettings.force_sequential_matching;
+        const canProcessLineByLine = (proseOriginalLines.length === translatedLines.length && proseOriginalLines.length > 0) ||
+                                   (forceSequentialMatching && (proseOriginalLines.length > 0 || translatedLines.length > 0));
+        
+        if (canProcessLineByLine) {
+            if (forceSequentialMatching && proseOriginalLines.length !== translatedLines.length && proseOriginalLines.length > 0 && translatedLines.length > 0) {
+                toastr.info('번역문과 원문의 내용 단락 수가 일치하지 않아 순서대로 표시합니다.');
+            }
+            
+            const resultHtmlParts = [];
+            let proseLineIndex = 0;
+
+            for (let i = 0; i < templateLines.length; i++) {
+                const templateLine = templateLines[i];
+                const translatedTemplateLine = translatedTemplateLines[i];
+                
+                if (placeholderRegexSingle.test(templateLine) && translatedPlaceholderRegexSingle.test(translatedTemplateLine)) {
+                    const originalBlock = specialBlocksMap[templateLine];
+                    const translatedBlock = translatedBlocksMap[translatedTemplateLine];
+                    
+                    const isCodeBlock = originalBlock.trim().startsWith('```');
+                    
+                    if (isCodeBlock) {
+                        resultHtmlParts.push(originalBlock);
+                    } else {
+                        let blockHTML = '';
+                        if (displayMode === 'folded') {
+                            blockHTML =
+                                '<details class="llm-translator-details mode-folded">' +
+                                    '<summary class="llm-translator-summary">' +
+                                        '<span class="translated_text clickable-text-org">' + translatedBlock + '</span>' +
+                                    '</summary>' +
+                                    '<span class="original_text">' + originalBlock + '</span>' +
+                                '</details>';
+                        } else if (displayMode === 'original_first') {
+                            blockHTML =
+                                '<details class="llm-translator-details mode-original-first">' +
+                                    '<summary class="llm-translator-summary">' +
+                                        '<span class="original_text clickable-text-org">' + originalBlock + '</span>' +
+                                    '</summary>' +
+                                    '<span class="translated_text">' + translatedBlock + '</span>' +
+                                '</details>';
+                        } else { 
+                            blockHTML =
+                                '<span class="translated_text mode-unfolded">' + translatedBlock + '</span>' +
+                                '<br>' +
+                                '<span class="original_text mode-unfolded">' + originalBlock + '</span>';
+                        }
+                        resultHtmlParts.push(blockHTML);
+                    }
+                } else if (templateLine === '') {
+                    resultHtmlParts.push('');
+                } else {
+                    if (forceSequentialMatching) {
+                        const hasOriginal = proseLineIndex < proseOriginalLines.length;
+                        const hasTranslated = proseLineIndex < translatedLines.length;
+                        
+                        if (hasOriginal && hasTranslated) {
+                            const originalProseLine = proseOriginalLines[proseLineIndex];
+                            const translatedLine = translatedLines[proseLineIndex];
+                            const correctedTranslatedLine = correctBackticks(translatedLine);
+
+                            let blockHTML = '';
+                            if (displayMode === 'folded') {
+                                blockHTML =
+                                    '<details class="llm-translator-details mode-folded">' +
+                                        '<summary class="llm-translator-summary">' +
+                                            '<span class="translated_text clickable-text-org">' + correctedTranslatedLine + '</span>' +
+                                        '</summary>' +
+                                        '<span class="original_text">' + originalProseLine + '</span>' +
+                                    '</details>';
+                            } else if (displayMode === 'original_first') {
+                                blockHTML =
+                                    '<details class="llm-translator-details mode-original-first">' +
+                                        '<summary class="llm-translator-summary">' +
+                                            '<span class="original_text clickable-text-org">' + originalProseLine + '</span>' +
+                                        '</summary>' +
+                                        '<span class="translated_text">' + correctedTranslatedLine + '</span>' +
+                                    '</details>';
+                            } else { 
+                                blockHTML =
+                                    '<span class="translated_text mode-unfolded">' + correctedTranslatedLine + '</span>' +
+                                    '<br>' +
+                                    '<span class="original_text mode-unfolded">' + originalProseLine + '</span>';
+                            }
+                            resultHtmlParts.push(blockHTML);
+                            proseLineIndex++;
+                        } else if (hasOriginal && !hasTranslated) {
+                            const originalProseLine = proseOriginalLines[proseLineIndex];
+                            resultHtmlParts.push('<span class="original_text">' + originalProseLine + '</span>');
+                            proseLineIndex++;
+                        } else if (!hasOriginal && hasTranslated) {
+                            const translatedLine = translatedLines[proseLineIndex];
+                            const correctedTranslatedLine = correctBackticks(translatedLine);
+                            resultHtmlParts.push('<span class="translated_text">' + correctedTranslatedLine + '</span>');
+                            proseLineIndex++;
+                        } else {
+                        }
+                    } else {
+                        if (proseLineIndex < proseOriginalLines.length) {
+                            const originalProseLine = proseOriginalLines[proseLineIndex];
+                            const translatedLine = translatedLines[proseLineIndex];
+                            const correctedTranslatedLine = correctBackticks(translatedLine);
+
+                            let blockHTML = '';
+                            if (displayMode === 'folded') {
+                                blockHTML =
+                                    '<details class="llm-translator-details mode-folded">' +
+                                        '<summary class="llm-translator-summary">' +
+                                            '<span class="translated_text clickable-text-org">' + correctedTranslatedLine + '</span>' +
+                                        '</summary>' +
+                                        '<span class="original_text">' + originalProseLine + '</span>' +
+                                    '</details>';
+                            } else if (displayMode === 'original_first') {
+                                blockHTML =
+                                    '<details class="llm-translator-details mode-original-first">' +
+                                        '<summary class="llm-translator-summary">' +
+                                            '<span class="original_text clickable-text-org">' + originalProseLine + '</span>' +
+                                        '</summary>' +
+                                        '<span class="translated_text">' + correctedTranslatedLine + '</span>' +
+                                    '</details>';
+                            } else { 
+                                blockHTML =
+                                    '<span class="translated_text mode-unfolded">' + correctedTranslatedLine + '</span>' +
+                                    '<br>' +
+                                    '<span class="original_text mode-unfolded">' + originalProseLine + '</span>';
+                            }
+                            resultHtmlParts.push(blockHTML);
+                            proseLineIndex++;
+                        } else {
+                        }
+                    }
+                }
+            }
+            
+            if (forceSequentialMatching) {
+                const maxLines = Math.max(proseOriginalLines.length, translatedLines.length);
+                
+                for (let i = proseLineIndex; i < maxLines; i++) {
+                    const hasOriginal = i < proseOriginalLines.length;
+                    const hasTranslated = i < translatedLines.length;
+                    
+                    if (hasOriginal && hasTranslated) {
+                        const originalProseLine = proseOriginalLines[i];
+                        const translatedLine = translatedLines[i];
+                        const correctedTranslatedLine = correctBackticks(translatedLine);
+
+                        let blockHTML = '';
+                        if (displayMode === 'folded') {
+                            blockHTML =
+                                '<details class="llm-translator-details mode-folded">' +
+                                    '<summary class="llm-translator-summary">' +
+                                        '<span class="translated_text clickable-text-org">' + correctedTranslatedLine + '</span>' +
+                                    '</summary>' +
+                                    '<span class="original_text">' + originalProseLine + '</span>' +
+                                '</details>';
+                        } else if (displayMode === 'original_first') {
+                            blockHTML =
+                                '<details class="llm-translator-details mode-original-first">' +
+                                    '<summary class="llm-translator-summary">' +
+                                        '<span class="original_text clickable-text-org">' + originalProseLine + '</span>' +
+                                    '</summary>' +
+                                    '<span class="translated_text">' + correctedTranslatedLine + '</span>' +
+                                '</details>';
+                        } else { 
+                            blockHTML =
+                                '<span class="translated_text mode-unfolded">' + correctedTranslatedLine + '</span>' +
+                                '<br>' +
+                                '<span class="original_text mode-unfolded">' + originalProseLine + '</span>';
+                        }
+                        resultHtmlParts.push(blockHTML);
+                    } else if (hasOriginal && !hasTranslated) {
+                        const originalProseLine = proseOriginalLines[i];
+                        resultHtmlParts.push('<span class="original_text">' + originalProseLine + '</span>');
+                    } else if (!hasOriginal && hasTranslated) {
+                        const translatedLine = translatedLines[i];
+                        const correctedTranslatedLine = correctBackticks(translatedLine);
+                        resultHtmlParts.push('<span class="translated_text">' + correctedTranslatedLine + '</span>');
+                    }
+                }
+            }
+            
+            const finalHtmlResult = resultHtmlParts.join('\n').trim();
+            return finalHtmlResult;
+
+        } else {
+            if (proseOriginalLines.length === 0 && translatedLines.length === 0 && templateLines.some(line => placeholderRegexSingle.test(line))) {
+                
+                const translatedTemplateLines = processedTranslated.split('\n').map(line => line.trim());
+                const translatedPlaceholderRegexSingle = new RegExp('^' + placeholderPrefix + 'TRANSLATED_\\d+' + placeholderSuffix + '$');
+                
+                const resultHtmlParts = [];
+                for (let i = 0; i < templateLines.length; i++) {
+                    const origLine = templateLines[i];
+                    const transLine = translatedTemplateLines[i];
+                    
+                    if (placeholderRegexSingle.test(origLine) && transLine && translatedPlaceholderRegexSingle.test(transLine)) {
+                        const originalBlock = specialBlocksMap[origLine];
+                        const translatedBlock = translatedBlocksMap[transLine];
+                        
+                        const isCodeBlock = originalBlock.trim().startsWith('```');
+                        
+                        if (isCodeBlock) {
+                            resultHtmlParts.push(translatedBlock);
+                        } else {
+                            let blockHTML = '';
+                            if (displayMode === 'folded') {
+                                blockHTML =
+                                    '<details class="llm-translator-details mode-folded">' +
+                                        '<summary class="llm-translator-summary">' +
+                                            '<span class="translated_text clickable-text-org">' + translatedBlock + '</span>' +
+                                        '</summary>' +
+                                        '<span class="original_text">' + originalBlock + '</span>' +
+                                    '</details>';
+                            } else if (displayMode === 'original_first') {
+                                blockHTML =
+                                    '<details class="llm-translator-details mode-original-first">' +
+                                        '<summary class="llm-translator-summary">' +
+                                            '<span class="original_text clickable-text-org">' + originalBlock + '</span>' +
+                                        '</summary>' +
+                                        '<span class="translated_text">' + translatedBlock + '</span>' +
+                                    '</details>';
+                            } else { 
+                                blockHTML =
+                                    '<span class="translated_text mode-unfolded">' + translatedBlock + '</span>' +
+                                    '<br>' +
+                                    '<span class="original_text mode-unfolded">' + originalBlock + '</span>';
+                            }
+                            resultHtmlParts.push(blockHTML);
+                        }
+                    } else if (placeholderRegexSingle.test(origLine)) {
+                        resultHtmlParts.push(specialBlocksMap[origLine]);
+                    } else {
+                        resultHtmlParts.push(origLine);
+                    }
+                }
+                
+                const finalHtmlResult = resultHtmlParts.join('\n').trim();
+                return finalHtmlResult;
+
+            } else {
+                 if (proseOriginalLines.length !== translatedLines.length) {
+                    if (forceSequentialMatching) {
+                        toastr.info('번역문과 원문의 내용 단락 수가 일치하지 않아 순서대로 표시합니다.');
+                    } else {
+                        toastr.warning('번역문과 원문의 내용 단락 수가 일치하지 않아 전체를 하나로 표시합니다.');
+                    }
+                 }
+
+                 const fallbackTranslated = correctBackticks(translatedText || ''); 
+                 const fallbackOriginal = originalText || ''; 
+
+                 let fallbackHTML = '';
+                 if (displayMode === 'folded') {
+                     fallbackHTML =
+                         '<details class="llm-translator-details mode-folded">' +
+                             '<summary class="llm-translator-summary">' +
+                                 '<span class="translated_text clickable-text-org">' + fallbackTranslated + '</span>' +
+                             '</summary>' +
+                             '<span class="original_text">' + fallbackOriginal + '</span>' +
+                         '</details>';
+                 } else if (displayMode === 'original_first') {
+                     fallbackHTML =
+                         '<details class="llm-translator-details mode-original-first">' +
+                             '<summary class="llm-translator-summary">' +
+                                 '<span class="original_text clickable-text-org">' + fallbackOriginal + '</span>' +
+                             '</summary>' +
+                             '<span class="translated_text">' + fallbackTranslated + '</span>' +
+                         '</details>';
+                 } else { 
+                     fallbackHTML =
+                         '<span class="translated_text mode-unfolded">' + fallbackTranslated + '</span>' +
+                         '<br>' +
+                         '<span class="original_text mode-unfolded">' + fallbackOriginal + '</span>';
+                 }
+                 return fallbackHTML;
+            }
+        }
+
+    } catch (error) {
+        console.error(`${DEBUG_PREFIX} Error during processTranslationText (Mode: ${displayMode}):`, error); 
+        toastr.error('번역문 처리 중 오류가 발생했습니다. 가공된 번역문을 표시합니다.');
+        return correctBackticks(translatedText || '');
+    }
+}
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'LlmTranslateLast',
+    callback: async () => {
+        const lastMessage = document.querySelector('#chat .mes:last-child');
+        let targetButton;
+        if (lastMessage) {
+            targetButton = lastMessage.querySelector('.mes_llm_translate');
+            if (targetButton) {
+                targetButton.click();
+                return '마지막 메시지를 LLM으로 번역합니다.';
+            } else {
+                return '마지막 메시지 LLM 번역 버튼을 찾을 수 없습니다.';
+            }
+        } else {
+            return '채팅 메시지가 없습니다.';
+        }
+    },
+    helpString: '마지막 메시지를 LLM 번역기로 번역합니다.',
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'LlmRetranslateCorrection',
+    callback: async (parsedArgs) => {
+        const messageIdStr = validateAndNormalizeMessageId(parsedArgs.messageId);
+
+        let actualMessageId = messageIdStr;
+        if (messageIdStr === 'last') {
+            const context = getContext();
+            if (!context || !context.chat || context.chat.length === 0) {
+                return '채팅 메시지가 없습니다.';
+            }
+            actualMessageId = context.chat.length - 1;
+        }
+
+        retranslateMessage(actualMessageId, 'correction', true).catch(error => {
+            console.error('Retranslation error:', error);
+            toastr.error(`메시지 ID ${actualMessageId} 교정 재번역 중 오류가 발생했습니다.`);
+        });
+        
+        return `메시지 ID ${actualMessageId} 교정 재번역을 시작했습니다.`;
+    },
+    helpString: '지정한 ID의 메시지를 교정 재번역합니다 (기존 번역문을 개선). messageId를 생략하면 마지막 메시지를 대상으로 합니다.\n사용법: /LlmRetranslateCorrection [messageId=<메시지ID>]',
+    namedArgumentList: [
+        SlashCommandNamedArgument.fromProps({
+            name: 'messageId',
+            description: '교정 재번역할 메시지의 ID 또는 "last" (마지막 메시지)',
+            isRequired: false,
+            defaultValue: '{{lastMessageId}}',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+    ],
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'LlmRetranslateGuidance',
+    callback: async (parsedArgs) => {
+        const messageIdStr = validateAndNormalizeMessageId(parsedArgs.messageId);
+
+        let actualMessageId = messageIdStr;
+        if (messageIdStr === 'last') {
+            const context = getContext();
+            if (!context || !context.chat || context.chat.length === 0) {
+                return '채팅 메시지가 없습니다.';
+            }
+            actualMessageId = context.chat.length - 1;
+        }
+
+        retranslateMessage(actualMessageId, 'guidance', true).catch(error => {
+            console.error('Retranslation error:', error);
+            toastr.error(`메시지 ID ${actualMessageId} 지침교정 재번역 중 오류가 발생했습니다.`);
+        });
+        
+        return `메시지 ID ${actualMessageId} 지침교정 재번역을 시작했습니다.`;
+    },
+    helpString: '지정한 ID의 메시지를 지침교정 재번역합니다 (추가 지침을 입력받아 번역문을 개선). messageId를 생략하면 마지막 메시지를 대상으로 합니다.\n사용법: /LlmRetranslateGuidance [messageId=<메시지ID>]',
+    namedArgumentList: [
+        SlashCommandNamedArgument.fromProps({
+            name: 'messageId',
+            description: '지침교정 재번역할 메시지의 ID 또는 "last" (마지막 메시지)',
+            isRequired: false,
+            defaultValue: '{{lastMessageId}}',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+    ],
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'LlmRetranslateParagraph',
+    callback: async (parsedArgs) => {
+        const messageIdStr = validateAndNormalizeMessageId(parsedArgs.messageId);
+
+        let actualMessageId = messageIdStr;
+        if (messageIdStr === 'last') {
+            const context = getContext();
+            if (!context || !context.chat || context.chat.length === 0) {
+                return '채팅 메시지가 없습니다.';
+            }
+            actualMessageId = context.chat.length - 1;
+        }
+
+        retranslateMessage(actualMessageId, 'paragraph', true).catch(error => {
+            console.error('Retranslation error:', error);
+            toastr.error(`메시지 ID ${actualMessageId} 문단 구조 맞추기 재번역 중 오류가 발생했습니다.`);
+        });
+        
+        return `메시지 ID ${actualMessageId} 문단 구조 맞추기 재번역을 시작했습니다.`;
+    },
+    helpString: '지정한 ID의 메시지를 문단 구조 맞추기 재번역합니다 (원문 구조에 맞춰 재번역). messageId를 생략하면 마지막 메시지를 대상으로 합니다.\n사용법: /LlmRetranslateParagraph [messageId=<메시지ID>]',
+    namedArgumentList: [
+        SlashCommandNamedArgument.fromProps({
+            name: 'messageId',
+            description: '문단 맞추기 재번역할 메시지의 ID 또는 "last" (마지막 메시지)',
+            isRequired: false,
+            defaultValue: '{{lastMessageId}}',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+    ],
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'LlmTranslateID',
+    callback: async (parsedArgs) => {
+        const messageIdStr = validateAndNormalizeMessageId(parsedArgs.messageId);
+
+        let actualMessageId = messageIdStr;
+        if (messageIdStr === 'last') {
+            const context = getContext();
+            if (!context || !context.chat || context.chat.length === 0) {
+                return '채팅 메시지가 없습니다.';
+            }
+            actualMessageId = context.chat.length - 1;
+        }
+
+        const messageId = parseInt(actualMessageId, 10);
+        if (isNaN(messageId) || messageId < 0) {
+            return `유효하지 않은 메시지 ID: "${actualMessageId}". 숫자를 입력하세요.`;
+        }
+
+        const context = getContext();
+        if (!context || !context.chat) {
+            return '컨텍스트 또는 채팅 데이터를 찾을 수 없습니다.';
+        }
+        if (messageId >= context.chat.length) {
+            return `메시지 ID ${messageId}를 찾을 수 없습니다. (채팅 길이: ${context.chat.length})`;
+        }
+
+        translateMessage(messageId, true, 'LlmTranslateID_command').catch(error => {
+            console.error('Translation error:', error);
+            toastr.error(`메시지 ID ${messageId} 번역 중 오류가 발생했습니다.`);
+        });
+        
+        return `메시지 ID ${messageId} 번역을 시작했습니다.`;
+    },
+    helpString: '지정한 ID의 메시지를 LLM 번역기로 번역합니다. messageId를 생략하면 마지막 메시지를 대상으로 합니다.\n사용법: /LlmTranslateID [messageId=<메시지ID>]',
+    namedArgumentList: [
+        SlashCommandNamedArgument.fromProps({
+            name: 'messageId',
+            description: '번역할 메시지의 ID 또는 "last" (마지막 메시지)',
+            isRequired: false,
+            defaultValue: '{{lastMessageId}}',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+    ],
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+	name: 'llmDBUploadBackup',
+	callback: backupTranslationsToMetadata,
+	helpString: 'LLM 번역 캐시를 현재 채팅 메타데이터에 백업합니다. (백업용 채팅에서 실행 권장)',
+	returns: '백업 진행 및 결과 알림 (toastr)',
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+	name: 'llmDBDownloadRestore',
+	callback: restoreTranslationsFromMetadata, 
+	helpString: '현재 채팅 메타데이터의 백업에서 번역 캐시를 복원/병합합니다 (없는 데이터만 추가).',
+	returns: '복원 진행(프로그레스 바) 및 결과 알림 (toastr)',
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+	name: 'llmDBmetaClearBackup',
+	callback: clearBackupFromMetadata,
+	helpString: '현재 채팅 메타데이터에서 LLM 번역 캐시 백업을 삭제합니다 (영구 삭제).',
+	returns: '삭제 확인 팝업 및 결과 알림 (toastr)',
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'llmGetTranslation',
+    callback: async (parsedArgs) => {
+        const DEBUG_PREFIX_CMD = `[${extensionName} - Cmd /llmGetTranslation]`;
+        logDebug(`${DEBUG_PREFIX_CMD} Executing with args:`, parsedArgs);
+
+        let messageIdStr = validateAndNormalizeMessageId(parsedArgs.messageId);
+
+        if (messageIdStr === 'last') {
+            const context = getContext();
+            if (!context || !context.chat || context.chat.length === 0) {
+                return '오류: 채팅 메시지가 없습니다.';
+            }
+            messageIdStr = String(context.chat.length - 1); 
+            logDebug(`${DEBUG_PREFIX_CMD} 'last' converted to messageId: ${messageIdStr}`);
+        }
+
+        return await getTranslationById(messageIdStr);
+    },
+    helpString: '지정한 메시지 ID의 LLM 번역문을 DB에서 가져옵니다. messageId를 생략하면 마지막 메시지를 대상으로 합니다.\n사용법: /llmGetTranslation [messageId=<메시지ID>]',
+    namedArgumentList: [
+        SlashCommandNamedArgument.fromProps({
+            name: 'messageId',
+            description: '번역문을 가져올 메시지의 숫자 ID 또는 "last" (마지막 메시지)',
+            isRequired: false,
+            defaultValue: '{{lastMessageId}}',
+            typeList: [ARGUMENT_TYPE.STRING], 
+        }),
+    ],
+    returns: '번역문 또는 오류/정보 메시지',
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'llmDBDeleteTranslation', 
+    callback: async (parsedArgs) => {
+        const DEBUG_PREFIX_CMD = `[${extensionName} - Cmd /llmDBDeleteTranslation]`;
+        logDebug(`${DEBUG_PREFIX_CMD} Executing with args:`, parsedArgs);
+
+        const messageIdStr = validateAndNormalizeMessageId(parsedArgs.messageId);
+        const swipeNumberStr = parsedArgs.swipeNumber; 
+
+        return await deleteTranslationById(messageIdStr, swipeNumberStr);
+    },
+    helpString: '지정한 메시지 ID (및 선택적 스와이프 번호)의 LLM 번역 기록(DB) 및 화면 표시를 삭제합니다. messageId를 생략하면 마지막 메시지를 대상으로 합니다.\n사용법: /llmDBDeleteTranslation [messageId=<메시지ID>] [swipeNumber=<스와이프번호>]',
+    namedArgumentList: [
+        SlashCommandNamedArgument.fromProps({
+            name: 'messageId', 
+            description: '삭제할 번역이 있는 메시지의 숫자 ID',
+            isRequired: false, 
+            defaultValue: '{{lastMessageId}}',
+            typeList: [ARGUMENT_TYPE.STRING], 
+        }),
+        SlashCommandNamedArgument.fromProps({
+            name: 'swipeNumber', 
+            description: '삭제할 스와이프 번호 (1부터 시작). 생략 시 현재 활성화된 스와이프/메시지 기준.',
+            isRequired: false, 
+            typeList: [ARGUMENT_TYPE.INTEGER], 
+        }),
+    ],
+    returns: '삭제 작업 성공/실패/정보 메시지',
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'llmTranslate',
+    helpString: 'LLM을 사용하여 텍스트를 번역합니다. 확장 프로그램 설정의 LLM 프롬프트 및 공급자 설정을 사용합니다.',
+    unnamedArgumentList: [
+        new SlashCommandArgument('번역할 텍스트', ARGUMENT_TYPE.STRING, true, false, ''),
+    ],
+    callback: async (args, value) => {
+        const prompt = extensionSettings.llm_prompt_chat || 'Please translate the following text to the user\'s preferred language (or a sensible default if not specified):'; 
+        const textToTranslate = String(value);
+
+        if (!textToTranslate.trim()) {
+            return '번역할 텍스트를 입력해주세요.'; 
+        }
+
+        try {
+            const translatedText = await translate(textToTranslate, { prompt: prompt });
+            return translatedText;
+        } catch (error) {
+            console.error('LLMTranslate Slash Command Error:', error);
+            return `LLM 번역 중 오류 발생: ${error.message}`;
+        }
+    },
+    returns: ARGUMENT_TYPE.STRING,
+}));
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'llmGetTranslations',
+    callback: async (parsedArgs) => {
+        const DEBUG_PREFIX_CMD = `[${extensionName} - Cmd /llmGetTranslations]`;
+        logDebug(`${DEBUG_PREFIX_CMD} Executing with args:`, parsedArgs);
+
+        let startIdStr = parsedArgs.startId || '0';
+        let endIdStr = parsedArgs.endId || '{{lastMessageId}}';
+        const includeOriginal = parsedArgs.includeOriginal === 'true'; 
+        const includeMessageId = parsedArgs.includeMessageId === 'true'; 
+        const excludeHidden = parsedArgs.excludeHidden !== 'false'; 
+
+        if (endIdStr === '{{lastMessageId}}' || endIdStr === 'last') {
+            const context = getContext();
+            if (!context || !context.chat || context.chat.length === 0) {
+                return '오류: 채팅 메시지가 없습니다.';
+            }
+            endIdStr = String(context.chat.length - 1);
+            logDebug(`${DEBUG_PREFIX_CMD} 'last' converted to endId: ${endIdStr}`);
+        }
+
+        if (startIdStr === 'last') {
+            const context = getContext();
+            if (!context || !context.chat || context.chat.length === 0) {
+                return '오류: 채팅 메시지가 없습니다.';
+            }
+            startIdStr = String(context.chat.length - 1);
+            logDebug(`${DEBUG_PREFIX_CMD} 'last' converted to startId: ${startIdStr}`);
+        }
+
+        return await getTranslationsInRange(startIdStr, endIdStr, includeOriginal, includeMessageId, excludeHidden);
+    },
+    helpString: '지정한 범위의 메시지들의 번역문을 가져옵니다. 기본적으로 번역문만 ID 없이 출력하고 숨겨진 메시지는 제외합니다.\n사용법: /llmGetTranslations [startId=<시작ID>] [endId=<종료ID>] [includeOriginal=true/false] [includeMessageId=true/false] [excludeHidden=true/false]',
+    namedArgumentList: [
+        SlashCommandNamedArgument.fromProps({
+            name: 'startId',
+            description: '시작 메시지 ID (기본값: 0)',
+            isRequired: false,
+            defaultValue: '0',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+        SlashCommandNamedArgument.fromProps({
+            name: 'endId',
+            description: '종료 메시지 ID (기본값: 마지막 메시지)',
+            isRequired: false,
+            defaultValue: '{{lastMessageId}}',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+        SlashCommandNamedArgument.fromProps({
+            name: 'includeOriginal',
+            description: '번역문이 없을 때 원문 포함 여부 (기본값: false)',
+            isRequired: false,
+            defaultValue: 'false',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+        SlashCommandNamedArgument.fromProps({
+            name: 'includeMessageId',
+            description: '메시지 ID 출력 여부 (기본값: false)',
+            isRequired: false,
+            defaultValue: 'false',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+        SlashCommandNamedArgument.fromProps({
+            name: 'excludeHidden',
+            description: '숨겨진 메시지 제외 여부 (기본값: true)',
+            isRequired: false,
+            defaultValue: 'true',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+    ],
+    returns: '범위 내 번역문들을 연결한 텍스트',
+}));
+
+
+logDebug('Slash Commands registered successfully.');
+
+class PromptManager {
+    constructor() {
+        this.customPrompts = [];
+        this.loadFromLocalStorage();
+        this.initializeEventListeners();
+    }
+
+    loadFromLocalStorage() {
+        const saved = localStorage.getItem('customPrompts');
+        if (saved) {
+            this.customPrompts = JSON.parse(saved);
+            this.updatePromptDropdown();
+
+            const savedPromptId = extensionSettings.selected_translation_prompt_id;
+            if (savedPromptId) {
+                const selectedPrompt = this.customPrompts.find(p => p.id === savedPromptId);
+                if (selectedPrompt) {
+                    extensionSettings.selected_translation_prompt = selectedPrompt.content;
+                    logDebug('Loaded saved prompt:', selectedPrompt.title);
+                }
+            }
+        }
+    }
+
+    initializeEventListeners() {
+        $(document).off('click', '#addPromptBtn').on('click', '#addPromptBtn', () => {
+            this.showAddPromptDialog();
+        });
+        
+        $(document).off('click', '#deletePromptBtn').on('click', '#deletePromptBtn', () => {
+            this.deleteSelectedPrompt();
+        });
+
+        $(document).off('change', '#prompt_select').on('change', '#prompt_select', () => {
+            const promptSelect = document.getElementById('prompt_select');
+            const selectedId = promptSelect.value;
+            
+            this.loadPromptToEditor();
+            
+            const customPrompt = this.customPrompts.find(p => p.id === selectedId);
+            if (customPrompt) {
+                extensionSettings.selected_translation_prompt_id = selectedId;
+                extensionSettings.selected_translation_prompt = customPrompt.content;
+                logDebug('Selected translation prompt:', customPrompt.title, customPrompt.content);
+            } else {
+                extensionSettings.selected_translation_prompt_id = null;
+                extensionSettings.selected_translation_prompt = null;
+                logDebug('Using default translation prompt:', selectedId);
+            }
+            saveSettingsDebounced();
+        });
+
+        $(document).off('click', '#prompt_save_button').on('click', '#prompt_save_button', () => {
+            this.saveCurrentPrompt();
+        });
+    }
+
+    updatePromptDropdown() {
+        const promptSelect = document.getElementById('prompt_select');
+        if (!promptSelect) return;
+        
+        const currentValue = promptSelect.value;
+        
+        promptSelect.innerHTML = '';
+        
+        const mainOption = document.createElement('option');
+        mainOption.value = 'llm_prompt_chat';
+        mainOption.textContent = '채팅 번역 프롬프트';
+        promptSelect.appendChild(mainOption);
+        
+        this.customPrompts.forEach(prompt => {
+            const option = document.createElement('option');
+            option.value = prompt.id;
+            option.textContent = prompt.title;
+            promptSelect.appendChild(option);
+        });
+        
+        if (this.customPrompts.length > 0) {
+            const separator = document.createElement('option');
+            separator.disabled = true;
+            separator.textContent = '─────────────────';
+            promptSelect.appendChild(separator);
+        }
+        
+        const utilityPrompts = [
+            { value: 'llm_prompt_retranslate_correction', text: '⚙️ 재번역 (교정) 프롬프트' },
+            { value: 'llm_prompt_retranslate_guidance', text: '⚙️ 재번역 (지침교정) 프롬프트' },
+            { value: 'llm_prompt_retranslate_paragraph', text: '⚙️ 재번역 (문단 수 맞추기) 프롬프트' },
+            { value: 'llm_prompt_input', text: '⚙️ 입력 번역 프롬프트' },
+            { value: 'llm_prefill_content', text: '⚙️ 프리필' }
+        ];
+        
+        utilityPrompts.forEach(prompt => {
+            const option = document.createElement('option');
+            option.value = prompt.value;
+            option.textContent = prompt.text;
+            promptSelect.appendChild(option);
+        });
+
+        const valueExists = Array.from(promptSelect.options).some(opt => opt.value === currentValue && !opt.disabled);
+        if (valueExists && currentValue) {
+            promptSelect.value = currentValue;
+        } else {
+            promptSelect.value = 'llm_prompt_chat';
+        }
+        
+        this.loadPromptToEditor();
+    }
+
+    loadPromptToEditor() {
+        const promptSelect = document.getElementById('prompt_select');
+        const promptEditor = document.getElementById('llm_prompt_editor');
+        
+        if (!promptSelect || !promptEditor) return;
+        
+        const selectedValue = promptSelect.value;
+        
+        const customPrompt = this.customPrompts.find(p => p.id === selectedValue);
+        if (customPrompt) {
+            promptEditor.value = customPrompt.content;
+        } else {
+            if (selectedValue && selectedValue in extensionSettings) {
+                promptEditor.value = extensionSettings[selectedValue] || '';
+            } else {
+                promptEditor.value = '';
+            }
+        }
+    }
+
+    async showAddPromptDialog() {
+        const wrapper = document.createElement('div');
+        wrapper.classList.add('prompt-add-dialog');
+        wrapper.innerHTML = `
+            <div class="prompt-form">
+                <div class="prompt-title">프롬프트 추가</div>
+                <div class="prompt-form-group">
+                    <input type="text" id="promptTitle" class="text_pole wide" placeholder="프롬프트 이름을 입력하세요" required>
+                </div>
+            </div>
+        `;
+
+        const result = await callPopup(wrapper, 'confirm', '프롬프트 추가');
+        
+        if (!result) {
+            return; 
+        }
+
+        const title = document.getElementById('promptTitle').value.trim();
+        
+        if (!title) {
+            toastr.warning('프롬프트 이름을 입력해주세요.');
+            return;
+        }
+
+        const newPrompt = {
+            id: Date.now().toString(),
+            title: title,
+            content: defaultSettings.llm_prompt_chat, 
+            isCustom: true
+        };
+
+        this.customPrompts.push(newPrompt);
+        this.saveToLocalStorage();
+        this.updatePromptDropdown();
+        toastr.success('새 프롬프트가 추가되었습니다.');
+    }
+
+    deleteSelectedPrompt() {
+        const promptSelect = document.getElementById('prompt_select');
+        const selectedPrompt = this.customPrompts.find(p => p.id === promptSelect.value);
+        
+        if (!selectedPrompt || !selectedPrompt.isCustom) {
+            alert('삭제할 수 없는 프롬프트입니다.');
+            return;
+        }
+
+        if (confirm('선택한 프롬프트를 삭제하시겠습니까?')) {
+            const deletedPromptId = selectedPrompt.id;
+            this.customPrompts = this.customPrompts.filter(p => p.id !== deletedPromptId);
+            this.saveToLocalStorage();
+
+            if (extensionSettings.selected_translation_prompt_id === deletedPromptId) {
+                extensionSettings.selected_translation_prompt_id = null;
+                extensionSettings.selected_translation_prompt = null;
+                saveSettingsDebounced();
+            }
+
+            this.updatePromptDropdown();
+            
+            toastr.success('프롬프트가 삭제되었습니다.');
+        }
+    }
+
+    getSelectedPrompt() {
+        const savedPromptId = extensionSettings.selected_translation_prompt_id;
+        if (!savedPromptId) return null;
+
+        return this.customPrompts.find(p => p.id === savedPromptId);
+    }
+
+    saveToLocalStorage() {
+        localStorage.setItem('customPrompts', JSON.stringify(this.customPrompts));
+    }
+
+    saveCurrentPrompt() {
+        const promptSelector = document.getElementById('prompt_select');
+        const promptEditor = document.getElementById('llm_prompt_editor');
+        const selectedValue = promptSelector.value;
+        const newContent = promptEditor.value.trim();
+
+        if (!newContent) {
+            toastr.error('프롬프트 내용을 입력해주세요.');
+            return;
+        }
+
+        const customPrompt = this.customPrompts.find(p => p.id === selectedValue);
+        if (customPrompt) {
+            customPrompt.content = newContent;
+            this.saveToLocalStorage();
+            
+            if (extensionSettings.selected_translation_prompt_id === customPrompt.id) {
+                extensionSettings.selected_translation_prompt = newContent;
+                saveSettingsDebounced();
+            }
+            
+            toastr.success(`프롬프트 "${customPrompt.title}"가 저장되었습니다.`);
+        } else {
+            const promptKey = selectedValue;
+            if (promptKey && promptKey in extensionSettings) {
+                extensionSettings[promptKey] = newContent;
+                saveSettingsDebounced();
+                toastr.success('프롬프트가 저장되었습니다.');
+            }
+        }
+    }
+}
+
+SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+    name: 'LlmToggleTranslation',
+    callback: async (parsedArgs) => {
+        const messageIdStr = validateAndNormalizeMessageId(parsedArgs.messageId);
+
+        let actualMessageId = messageIdStr;
+        if (messageIdStr === 'last') {
+            const context = getContext();
+            if (!context || !context.chat || context.chat.length === 0) {
+                return '채팅 메시지가 없습니다.';
+            }
+            actualMessageId = context.chat.length - 1;
+        }
+
+        const messageId = parseInt(actualMessageId, 10);
+        if (isNaN(messageId) || messageId < 0) {
+            return `유효하지 않은 메시지 ID: "${actualMessageId}". 숫자를 입력하세요.`;
+        }
+
+        const context = getContext();
+        if (!context || !context.chat) {
+            return '컨텍스트 또는 채팅 데이터를 찾을 수 없습니다.';
+        }
+        if (messageId >= context.chat.length) {
+            return `메시지 ID ${messageId}를 찾을 수 없습니다. (채팅 길이: ${context.chat.length})`;
+        }
+
+        if (translationInProgress[messageId]) {
+            toastr.info('번역이 이미 진행 중입니다.');
+            return `메시지 ID ${messageId}는 이미 번역이 진행 중입니다.`;
+        }
+
+        handleTranslateButtonClick(messageId).catch(error => {
+            console.error('Translation toggle error:', error);
+            toastr.error(`메시지 ID ${messageId} 번역/원문 전환 중 오류가 발생했습니다.`);
+        });
+        
+        return `메시지 ID ${messageId} 번역/원문 전환을 시작했습니다.`;
+    },
+    helpString: '지정한 ID의 메시지에서 번역문과 원문을 전환합니다. 번역문이 없으면 번역을 실행하고, 번역문이 표시되어 있으면 원문을 표시하며, 원문이 표시되어 있으면 번역을 실행합니다. messageId를 생략하면 마지막 메시지를 대상으로 합니다.\n사용법: /LlmToggleTranslation [messageId=<메시지ID>]',
+    namedArgumentList: [
+        SlashCommandNamedArgument.fromProps({
+            name: 'messageId',
+            description: '번역/원문을 전환할 메시지의 ID 또는 "last" (마지막 메시지)',
+            isRequired: false,
+            defaultValue: '{{lastMessageId}}',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+    ],
+}));
+
+let promptManager = null;
