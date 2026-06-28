@@ -247,9 +247,10 @@ label[for="llm_rule_prompt"] {
    개인적으로 추가
 ────────────────────────────────────────────── */
 
+/* 테마 폰트 그대로 적 */
 .custom-llm-translator-details,
-.custom-llm-translator-details *  {
-    font-family: inherit !important;
+.custom-llm-translator-details * {
+    font-family: inherit  !important;
     font-size: inherit !important;
     line-height: inherit !important;
 }
