@@ -247,11 +247,9 @@ label[for="llm_rule_prompt"] {
    개인적으로 추가
 ────────────────────────────────────────────── */
 
-/* 원문 먼저 보기 */
-.llm-translator-details > summary,
-.llm-translator-summary {
-    font-family: inherit;
-    font-size: inherit;
-    font-weight: inherit;
-    color: inherit;
+.custom-llm-translator-details,
+.custom-llm-translator-details *  {
+    font-family: inherit !important;
+    font-size: inherit !important;
+    line-height: inherit !important;
 }
