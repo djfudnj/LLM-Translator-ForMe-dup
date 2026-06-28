@@ -242,3 +242,16 @@ label[for="llm_rule_prompt"] {
 .gap0 {
     gap: 0 !important;
 }
+
+/* ──────────────────────────────────────────────
+   개인적으로 추가
+────────────────────────────────────────────── */
+
+/* 원문 먼저 보기 */
+.llm-translator-details > summary,
+.llm-translator-summary {
+    font-family: inherit;
+    font-size: inherit;
+    font-weight: inherit;
+    color: inherit;
+}
